@@ -22,6 +22,36 @@ function messageText(message: { parts?: Array<{ type: string; text?: string }> }
     .join("");
 }
 
+type ToolPart = { type: string; state?: string; output?: unknown };
+
+/** URLs the tools actually returned, used to verify the report's citations. */
+function retrievedSources(message: { parts?: ToolPart[] }) {
+  const sources = new Map<string, string>();
+  const add = (url: unknown, title: unknown) => {
+    if (typeof url !== "string") return;
+    try {
+      const parsed = new URL(url);
+      parsed.hash = "";
+      sources.set(parsed.href.replace(/\/$/, ""), typeof title === "string" ? title : url);
+    } catch {
+      /* ignore malformed URLs */
+    }
+  };
+  for (const part of message.parts || []) {
+    if (part.state !== "output-available" || !part.output) continue;
+    const output = part.output as {
+      url?: string;
+      title?: string;
+      links?: { url: string; text: string }[];
+      results?: { url: string; title: string }[];
+    };
+    add(output.url, output.title);
+    output.results?.forEach((result) => add(result.url, result.title));
+    output.links?.forEach((link) => add(link.url, link.text));
+  }
+  return sources;
+}
+
 function toolStatus(message: {
   parts?: Array<{ type: string; state?: string; input?: unknown }>;
 }) {
@@ -206,6 +236,10 @@ export function ResearchDashboard() {
               messages.map((message) => {
                 const text = messageText(message);
                 const statuses = toolStatus(message);
+                const sources = retrievedSources(message as { parts?: ToolPart[] });
+                const readCount = (message.parts || []).filter(
+                  (part) => part.type === "tool-read_document",
+                ).length;
                 if (message.role === "user") {
                   return (
                     <div key={message.id} className="ml-auto max-w-3xl">
@@ -229,9 +263,25 @@ export function ResearchDashboard() {
                       </div>
                     )}
                     {text ? (
-                      <MarkdownRenderer content={text} />
+                      <MarkdownRenderer content={text} verifiedUrls={new Set(sources.keys())} />
                     ) : (
                       <span className="sr-only">Research in progress</span>
+                    )}
+                    {text && readCount > 0 && (
+                      <details className="mt-4 rounded-2xl border border-cream-300 bg-white/40 px-4 py-3 text-xs text-cream-700">
+                        <summary className="cursor-pointer">
+                          {readCount} page{readCount === 1 ? "" : "s"} read · {sources.size} sources surfaced
+                        </summary>
+                        <ul className="mt-2 space-y-1">
+                          {Array.from(sources).slice(0, 60).map(([url, title]) => (
+                            <li key={url}>
+                              <a href={url} target="_blank" rel="noopener noreferrer" className="underline">
+                                {title}
+                              </a>
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
                     )}
                   </article>
                 );

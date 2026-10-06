@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isAllowedVedicUrl } from "./browser";
+import { isAllowedVedicUrl, isGatePath } from "./browser";
 
 describe("source URL boundary", () => {
   it("allows HTTPS pages on vedic.study and its subdomains", () => {
@@ -12,5 +12,14 @@ describe("source URL boundary", () => {
     expect(isAllowedVedicUrl("https://example.com/")).toBe(false);
     expect(isAllowedVedicUrl("http://vedic.study/")).toBe(false);
     expect(isAllowedVedicUrl("https://user:pass@vedic.study/")).toBe(false);
+  });
+});
+
+describe("invite gate detection", () => {
+  it("recognizes the sign-in gate path only", () => {
+    expect(isGatePath("/gate")).toBe(true);
+    expect(isGatePath("/gate/")).toBe(true);
+    expect(isGatePath("/gateway")).toBe(false);
+    expect(isGatePath("/texts/gate")).toBe(false);
   });
 });

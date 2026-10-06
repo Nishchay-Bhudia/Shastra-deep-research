@@ -4,8 +4,13 @@ import { chromium, type Browser, type BrowserContext, type Response } from "play
 
 const TARGET_HOST = "vedic.study";
 const MAX_RESULTS = 12;
-const MAX_TEXT_LENGTH = 30_000;
+const MAX_TEXT_LENGTH = 120_000;
+const MAX_LINKS = 40;
 const NAVIGATION_TIMEOUT_MS = 25_000;
+const SETTLE_TIMEOUT_MS = 8_000;
+const MAX_CONCURRENT_PAGES = 3;
+const CACHE_TTL_MS = 10 * 60_000;
+const CACHE_MAX_ENTRIES = 150;
 
 export type SearchResult = {
   title: string;
@@ -13,11 +18,57 @@ export type SearchResult = {
   snippet: string;
 };
 
+export type SourceLink = {
+  text: string;
+  url: string;
+};
+
 export type SourceDocument = {
   title: string;
   url: string;
   content: string;
+  links: SourceLink[];
 };
+
+/** The site's invite gate ("Not Yet Open") is an access control, not content. */
+export function isGatePath(pathname: string): boolean {
+  return /^\/gate(\/|$)/i.test(pathname);
+}
+
+class Semaphore {
+  private waiting: Array<() => void> = [];
+  private active = 0;
+  constructor(private readonly limit: number) {}
+
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    if (this.active >= this.limit) {
+      await new Promise<void>((resolve) => this.waiting.push(resolve));
+    }
+    this.active += 1;
+    try {
+      return await task();
+    } finally {
+      this.active -= 1;
+      this.waiting.shift()?.();
+    }
+  }
+}
+
+const pageLimiter = new Semaphore(MAX_CONCURRENT_PAGES);
+
+const cache = new Map<string, { expires: number; value: unknown }>();
+
+async function cached<T>(key: string, load: () => Promise<T>): Promise<T> {
+  const hit = cache.get(key);
+  if (hit && hit.expires > Date.now()) return hit.value as T;
+  const value = await load();
+  cache.set(key, { expires: Date.now() + CACHE_TTL_MS, value });
+  if (cache.size > CACHE_MAX_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  return value;
+}
 
 let browserPromise: Promise<Browser> | undefined;
 
@@ -38,7 +89,7 @@ export function isAllowedVedicUrl(candidate: string): boolean {
 function getSearchUrl(query: string): string {
   const template =
     process.env.VEDIC_SEARCH_URL_TEMPLATE ||
-    "https://vedic.study/search?q={query}";
+    "https://www.vedic.study/search?q={query}";
   const url = template.replace("{query}", encodeURIComponent(query));
   if (!isAllowedVedicUrl(url)) {
     throw new Error(
@@ -150,6 +201,18 @@ async function openAllowedPage(context: BrowserContext, url: string) {
     );
   }
 
+  // The site is a client-rendered app: let it finish loading before reading.
+  await page
+    .waitForLoadState("networkidle", { timeout: SETTLE_TIMEOUT_MS })
+    .catch(() => undefined);
+
+  if (isGatePath(new URL(page.url()).pathname)) {
+    await page.close();
+    throw new Error(
+      "vedic.study is invite-only and redirected to its sign-in gate. Provide an authorized session with `npm run capture:vedic-session` (VEDIC_STUDY_STORAGE_STATE_PATH); this app will not bypass the gate.",
+    );
+  }
+
   const status = response?.status();
   if (status === 401 || status === 403 || status === 429) {
     await page.close();
@@ -161,9 +224,12 @@ async function openAllowedPage(context: BrowserContext, url: string) {
   return page;
 }
 
-export async function searchVedicKnowledgeBase(
-  query: string,
-): Promise<SearchResult[]> {
+export function searchVedicKnowledgeBase(query: string): Promise<SearchResult[]> {
+  const key = `search:${query.trim().toLowerCase()}`;
+  return cached(key, () => pageLimiter.run(() => runSearch(query)));
+}
+
+async function runSearch(query: string): Promise<SearchResult[]> {
   const context = await getContext();
   try {
     const page = await openAllowedPage(context, getSearchUrl(query));
@@ -218,7 +284,7 @@ export async function searchVedicKnowledgeBase(
           return results
             .filter((item) => {
               const pathname = new URL(item.url).pathname.toLowerCase();
-              return !/\/(login|logout|signup|register|search|account|profile)(\/|$)/.test(
+              return !/\/(gate|login|logout|signup|register|search|account|profile)(\/|$)/.test(
                 pathname,
               );
             })
@@ -234,16 +300,20 @@ export async function searchVedicKnowledgeBase(
   }
 }
 
-export async function readVedicDocument(url: string): Promise<SourceDocument> {
+export function readVedicDocument(url: string): Promise<SourceDocument> {
   if (!isAllowedVedicUrl(url)) {
-    throw new Error("Only HTTPS vedic.study URLs can be read.");
+    return Promise.reject(new Error("Only HTTPS vedic.study URLs can be read."));
   }
+  return cached(`doc:${url}`, () => pageLimiter.run(() => runRead(url)));
+}
 
+async function runRead(url: string): Promise<SourceDocument> {
   const context = await getContext();
   try {
     const page = await openAllowedPage(context, url);
     try {
-      const loadedDocument = await page.evaluate((maxTextLength) => {
+      const loadedDocument = await page.evaluate((options) => {
+        const { maxTextLength, maxLinks, allowedHost } = options;
         const removeSelectors = [
           "script",
           "style",
@@ -258,6 +328,39 @@ export async function readVedicDocument(url: string): Promise<SourceDocument> {
           "[role=navigation]",
           "[aria-hidden=true]",
         ];
+        const main0 =
+          document.querySelector("main article") ||
+          document.querySelector("article") ||
+          document.querySelector("main") ||
+          document.querySelector('[role="main"]') ||
+          document.body;
+        const seenLinks = new Set<string>();
+        const links: { text: string; url: string }[] = [];
+        for (const anchor of Array.from(main0.querySelectorAll<HTMLAnchorElement>("a[href]"))) {
+          let target: URL;
+          try {
+            target = new URL(anchor.href);
+          } catch {
+            continue;
+          }
+          target.hash = "";
+          const text = (anchor.textContent || "").replace(/\s+/g, " ").trim();
+          if (
+            target.protocol !== "https:" ||
+            !(target.hostname === allowedHost || target.hostname.endsWith(`.${allowedHost}`)) ||
+            target.pathname === "/" ||
+            /^\/(gate|login|logout|signup|register|account|profile)(\/|$)/i.test(target.pathname) ||
+            target.href === window.location.href ||
+            text.length < 2 ||
+            seenLinks.has(target.href)
+          ) {
+            continue;
+          }
+          seenLinks.add(target.href);
+          links.push({ text: text.slice(0, 120), url: target.href });
+          if (links.length >= maxLinks) break;
+        }
+
         document.querySelectorAll(removeSelectors.join(",")).forEach((node) => node.remove());
 
         const main =
@@ -279,8 +382,9 @@ export async function readVedicDocument(url: string): Promise<SourceDocument> {
           title: title.replace(/\s+/g, " ").slice(0, 240),
           url: window.location.href,
           content,
+          links,
         };
-      }, MAX_TEXT_LENGTH);
+      }, { maxTextLength: MAX_TEXT_LENGTH, maxLinks: MAX_LINKS, allowedHost: TARGET_HOST });
 
       if (!isAllowedVedicUrl(loadedDocument.url)) {
         throw new Error("The page URL changed to a disallowed domain.");

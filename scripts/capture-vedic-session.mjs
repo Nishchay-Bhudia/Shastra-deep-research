@@ -16,12 +16,13 @@ const page = await context.newPage();
 const readline = createInterface({ input: stdin, output: stdout });
 
 try {
-  await page.goto("https://vedic.study", { waitUntil: "domcontentloaded" });
+  await page.goto("https://www.vedic.study", { waitUntil: "domcontentloaded" });
   console.log(
     "Sign in to vedic.study in the browser window using an account you are authorized to use.",
   );
   await readline.question("After sign-in is complete, press Enter here to save the session state: ");
-  await context.storageState({ path: statePath });
+  // The site keeps its sign-in in IndexedDB (Firebase auth), so it must be included.
+  await context.storageState({ path: statePath, indexedDB: true });
   console.log(`Saved the private browser state to ${statePath}`);
   console.log("Keep this file private. Do not commit it or share it in chat.");
 } finally {

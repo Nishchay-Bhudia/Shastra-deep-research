@@ -80,7 +80,7 @@ npm run build
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `ANTHROPIC_API_KEY` | Yes for research | Server-side model API key |
-| `ANTHROPIC_MODEL` | No | Model name; defaults to `claude-sonnet-4-20250514` |
+| `ANTHROPIC_MODEL` | No | Model name; defaults to `claude-sonnet-5-5` |
 | `APP_ACCESS_PASSWORD` | Yes | Shared sign-in password for this private instance |
 | `SESSION_SECRET` | Yes | Random secret of at least 32 characters for signed sessions |
 | `VEDIC_STUDY_STORAGE_STATE_PATH` | No | Server-side path to an authorized Playwright storage-state file |
@@ -89,6 +89,17 @@ npm run build
 
 The app is designed as a single private instance with one shared password, not as a multi-user identity system. Use HTTPS when deploying it and keep API keys and browser-session data in the deployment's secret manager or private file storage.
 
+## Access to vedic.study
+
+As of October 2026 the site is invite-only: unauthenticated requests are redirected to a "Not Yet Open" sign-in gate, and the bare `vedic.study` domain does not resolve (use `www.vedic.study`). The app detects the gate and reports it rather than trying to get around it. You need an invited account: run `npm run capture:vedic-session`, sign in yourself, and the saved state (including IndexedDB, where the site keeps its sign-in) is used for research. The search selectors have not been verified against signed-in pages, so check a first search result before relying on the agent.
+
+## How the agent works
+
+- Parallel searches and full-page reads, with long pages paged through an `offset`, and same-site links returned from each page so the agent can follow commentary and parallel passages.
+- The last allowed step always has tools disabled, so a run always ends in a written report; earlier steps get phase guidance (explore, deepen, close gaps).
+- Citations are checked in the UI: links that no tool returned are tagged "unverified".
+- Search and page results are cached for ten minutes and browser use is limited to three concurrent pages.
+
 ## Research and source limitations
 
-Reports are instructed to use retrieved `vedic.study` text as evidence and cite the exact pages returned by the scraper. Site search selectors and routes can change; the default search path is `https://vedic.study/search?q=...`, which can be overridden with `VEDIC_SEARCH_URL_TEMPLATE`. Results are extracted from same-site links and article text, so verify important quotations and translations against their source pages. No research result is guaranteed to be exhaustive or a substitute for scholarly review.
+Reports are instructed to use retrieved `vedic.study` text as evidence and cite the exact pages returned by the scraper. Site search selectors and routes can change; the default search path is `https://www.vedic.study/search?q=...`, which can be overridden with `VEDIC_SEARCH_URL_TEMPLATE`. Results are extracted from same-site links and article text, so verify important quotations and translations against their source pages. No research result is guaranteed to be exhaustive or a substitute for scholarly review.
