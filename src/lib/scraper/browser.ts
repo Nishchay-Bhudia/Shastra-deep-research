@@ -11,7 +11,8 @@ const MAX_TEXT_LENGTH = 120_000;
 const MAX_LINKS = 40;
 const NAVIGATION_TIMEOUT_MS = 25_000;
 const SETTLE_TIMEOUT_MS = 8_000;
-const MAX_CONCURRENT_PAGES = 3;
+const GATE_GRACE_MS = 25_000;
+const MAX_CONCURRENT_PAGES = process.env.VERCEL ? 2 : 3;
 const CACHE_TTL_MS = 10 * 60_000;
 const CACHE_MAX_ENTRIES = 150;
 
@@ -78,6 +79,7 @@ async function cached<T>(key: string, load: () => Promise<T>): Promise<T> {
 type ScraperGlobals = {
   __shastraBrowser?: Promise<Browser>;
   __shastraContext?: Promise<BrowserContext>;
+  __shastraSessionPage?: Page;
 };
 const scraperGlobals = globalThis as unknown as ScraperGlobals;
 
@@ -116,6 +118,7 @@ async function getBrowser() {
         browser.on("disconnected", () => {
           scraperGlobals.__shastraBrowser = undefined;
           scraperGlobals.__shastraContext = undefined;
+          scraperGlobals.__shastraSessionPage = undefined;
         });
         return browser;
       })
@@ -196,18 +199,54 @@ async function resetContext() {
  */
 async function warmUpSession(context: BrowserContext) {
   const page = await context.newPage();
+  const notes: string[] = [];
+  page.on("response", (response) => {
+    const url = response.url();
+    if (/securetoken|identitytoolkit|googleapis/.test(url)) {
+      notes.push(`${new URL(url).hostname}${new URL(url).pathname.slice(0, 30)} -> ${response.status()}`);
+    }
+  });
+  page.on("requestfailed", (request) => {
+    if (/securetoken|identitytoolkit|googleapis|vedic\.study/.test(request.url())) {
+      notes.push(`FAILED ${new URL(request.url()).hostname}: ${request.failure()?.errorText}`);
+    }
+  });
   try {
     await page.goto("https://www.vedic.study/", { waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS });
-    for (let waited = 0; waited < 12_000; waited += 500) {
+    for (let waited = 0; waited < 25_000; waited += 500) {
       const token = (await context.cookies()).find((cookie) => cookie.name === "firebase-token");
       if (token && token.expires * 1000 > Date.now() + 10 * 60_000) return;
       await page.waitForTimeout(500);
     }
-  } catch {
-    /* the real request reports any problem */
+  } catch (error) {
+    notes.push(`warm-up error: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
   } finally {
+    const cookies = await context.cookies().catch(() => []);
+    const databases = await page
+      .evaluate(async () => (await indexedDB.databases()).map((db) => db.name).join(","))
+      .catch(() => "unreadable");
+    warmUpDiagnostics = `url=${page.url()} cookies=${cookies.length} indexedDB=[${databases}] ${notes.slice(0, 6).join("; ")}`;
     await page.close().catch(() => undefined);
   }
+}
+
+let warmUpDiagnostics = "";
+
+/** A long-lived signed-in page on the site, used for same-origin fetches and to keep the token fresh. */
+async function getSessionPage(): Promise<Page> {
+  const existing = scraperGlobals.__shastraSessionPage;
+  if (existing && !existing.isClosed()) return existing;
+  const context = await getContext();
+  const page = await context.newPage();
+  scraperGlobals.__shastraSessionPage = page;
+  await page.route("**/*", (route) =>
+    ["image", "font", "media"].includes(route.request().resourceType()) ? route.abort() : route.continue(),
+  );
+  await page.goto("https://www.vedic.study/", { waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS });
+  await page
+    .waitForFunction(() => /firebase-token=/.test(document.cookie), undefined, { timeout: 20_000 })
+    .catch(() => undefined);
+  return page;
 }
 
 async function createContext(): Promise<BrowserContext> {
@@ -280,7 +319,11 @@ async function openAllowedPage(
   const page = await context.newPage();
   page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
   await page.route("**/*", async (route) => {
-    if (isAllowedVedicUrl(route.request().url())) {
+    // Images, fonts and media only cost CPU and bandwidth; the text is all we read.
+    if (["image", "font", "media"].includes(route.request().resourceType())) {
+      await route.abort();
+    } else if (isAllowedVedicUrl(route.request().url()) || /(^|\.)googleapis\.com$/.test(new URL(route.request().url()).hostname)) {
+      // googleapis.com carries the site's Firebase token refresh; without it the session cannot be restored.
       await route.continue();
     } else {
       await route.abort();
@@ -307,10 +350,28 @@ async function openAllowedPage(
   // The site is a client-rendered app: let it finish loading before reading.
   await contentReady(page).catch(() => undefined);
 
+  // A slow machine (a cold serverless function) can still be on the gate while the site restores the
+  // saved sign-in and refreshes its token. Give it time to leave the gate before concluding it failed.
   if (isGatePath(new URL(page.url()).pathname)) {
+    const recovered = await page
+      .waitForURL((next) => !isGatePath(next.pathname), { timeout: GATE_GRACE_MS })
+      .then(() => true)
+      .catch(() => false);
+    if (recovered) {
+      await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => undefined);
+      await contentReady(page).catch(() => undefined);
+    }
+  }
+  if (isGatePath(new URL(page.url()).pathname)) {
+    const token = (await context.cookies()).find((cookie) => cookie.name === "firebase-token");
+    const tokenState = !token
+      ? "no sign-in cookie"
+      : token.expires * 1000 > Date.now()
+        ? "sign-in cookie fresh"
+        : "sign-in cookie expired";
     await page.close();
     throw new GateError(
-      "vedic.study sent the saved session to its invite-only sign-in gate, so the session has expired or was revoked. Run `npm run login` to sign in again; this app does not bypass the gate.",
+      `vedic.study sent the saved session to its invite-only sign-in gate (${tokenState}), so the session has expired or was revoked [${warmUpDiagnostics}]. Run \`npm run login\` to sign in again; this app does not bypass the gate.`,
     );
   }
 
@@ -471,7 +532,108 @@ export function readVedicDocument(url: string): Promise<SourceDocument> {
   return cached(`doc:${normalized}`, () => pageLimiter.run(() => withGateRetry(() => runRead(normalized))));
 }
 
+/**
+ * Fast path: pages are server-rendered, so with the signed-in session an in-page fetch returns the
+ * full text in under a second, versus several seconds (far more on a serverless CPU) to render it.
+ * Returns undefined when the page does not look usable so the caller can render it instead.
+ */
+async function readViaFetch(url: string): Promise<SourceDocument | undefined> {
+  const page = await getSessionPage();
+  const result = await page.evaluate(
+    async ({ target, maxTextLength, maxLinks, allowedHost }) => {
+      const response = await fetch(target, { credentials: "include" });
+      const finalUrl = new URL(response.url);
+      if (!response.ok || /^\/gate(\/|$)/i.test(finalUrl.pathname)) {
+        return { status: response.status, gate: /^\/gate(\/|$)/i.test(finalUrl.pathname) };
+      }
+      const doc = new DOMParser().parseFromString(await response.text(), "text/html");
+
+      const pick = (root: Document) =>
+        root.querySelector("main article") ||
+        root.querySelector("article") ||
+        root.querySelector("main") ||
+        root.querySelector('[role="main"]') ||
+        root.body;
+
+      const links: { text: string; url: string }[] = [];
+      const seen = new Set<string>();
+      for (const anchor of Array.from(pick(doc).querySelectorAll("a[href]"))) {
+        let link: URL;
+        try {
+          link = new URL(anchor.getAttribute("href") || "", finalUrl);
+        } catch {
+          continue;
+        }
+        link.hash = "";
+        const text = (anchor.textContent || "").replace(/\s+/g, " ").trim();
+        if (
+          link.protocol !== "https:" ||
+          !(link.hostname === allowedHost || link.hostname.endsWith(`.${allowedHost}`)) ||
+          link.pathname === "/" ||
+          /^\/(gate|login|logout|signup|register|account|profile)(\/|$)/i.test(link.pathname) ||
+          link.href === finalUrl.href ||
+          text.length < 2 ||
+          seen.has(link.href)
+        ) {
+          continue;
+        }
+        seen.add(link.href);
+        links.push({ text: text.slice(0, 120), url: link.href });
+        if (links.length >= maxLinks) break;
+      }
+
+      doc
+        .querySelectorAll("script,style,noscript,svg,nav,header,footer,aside,form,button,[role=navigation],[aria-hidden=true]")
+        .forEach((node) => node.remove());
+      const main = pick(doc);
+      const title = doc.querySelector("h1")?.textContent?.trim() || doc.title || finalUrl.pathname;
+
+      // A detached document has no layout, so build line breaks from the block structure ourselves.
+      const blocks = /^(P|DIV|SECTION|ARTICLE|LI|UL|OL|H[1-6]|BLOCKQUOTE|TR|TABLE|PRE|DT|DD|FIGURE|FIGCAPTION)$/;
+      let text = "";
+      const walk = (node: Node) => {
+        if (node.nodeType === 3) {
+          text += (node.textContent || "").replace(/\s+/g, " ");
+        } else if (node.nodeType === 1) {
+          const el = node as Element;
+          if (el.tagName === "BR") text += "\n";
+          const block = blocks.test(el.tagName);
+          if (block) text += "\n";
+          el.childNodes.forEach(walk);
+          if (block) text += "\n";
+        }
+      };
+      walk(main);
+      const content = text
+        .split("\n")
+        .map((line) => line.trim())
+        .join("\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim()
+        .slice(0, maxTextLength);
+      return {
+        status: 200,
+        title: title.replace(/\s+/g, " ").slice(0, 240),
+        url: finalUrl.href,
+        content,
+        links,
+      };
+    },
+    { target: url, maxTextLength: MAX_TEXT_LENGTH, maxLinks: MAX_LINKS, allowedHost: TARGET_HOST },
+  );
+  if (result.status !== 200 || !("content" in result)) return undefined;
+  const ok = result as { title: string; url: string; content: string; links: SourceLink[] };
+  if (ok.content.length < 30 || !isAllowedVedicUrl(ok.url)) return undefined;
+  return { title: ok.title, url: ok.url, content: ok.content, links: ok.links };
+}
+
 async function runRead(url: string): Promise<SourceDocument> {
+  try {
+    const fast = await readViaFetch(url);
+    if (fast) return fast;
+  } catch {
+    /* fall back to rendering the page */
+  }
   const context = await getContext();
   try {
     const page = await openAllowedPage(context, url, (p) =>

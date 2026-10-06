@@ -11,8 +11,14 @@ export async function launchChromium(): Promise<Browser> {
       import("@sparticuz/chromium"),
       import("playwright-core"),
     ]);
+    // The bundled flags include --disable-web-security, which strips the Origin/Referer headers the
+    // site's Firebase API key is restricted by (its token lookup then fails with 403). Drop the
+    // flags that weaken web security; the rest are needed to run inside a serverless sandbox.
+    const args = serverless.args.filter(
+      (arg) => arg !== "--disable-web-security" && arg !== "--allow-running-insecure-content",
+    );
     return chromium.launch({
-      args: serverless.args,
+      args,
       executablePath: await serverless.executablePath(),
       headless: true,
     });
