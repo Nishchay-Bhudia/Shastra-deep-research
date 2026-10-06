@@ -1,6 +1,7 @@
 import { access } from "node:fs/promises";
 import path from "node:path";
-import { chromium, type Browser, type BrowserContext, type Response } from "playwright";
+import { normalizeVedicUrl } from "@/lib/vedic-url";
+import { chromium, type Browser, type BrowserContext, type Page, type Response } from "playwright";
 
 const TARGET_HOST = "vedic.study";
 const MAX_RESULTS = 15;
@@ -70,7 +71,13 @@ async function cached<T>(key: string, load: () => Promise<T>): Promise<T> {
   return value;
 }
 
-let browserPromise: Promise<Browser> | undefined;
+// Browser and session state live on globalThis: in `next dev`, every hot reload re-evaluates this
+// module, and module-level variables would launch (and leak) a new Chromium each time.
+type ScraperGlobals = {
+  __shastraBrowser?: Promise<Browser>;
+  __shastraContext?: Promise<BrowserContext>;
+};
+const scraperGlobals = globalThis as unknown as ScraperGlobals;
 
 export function isAllowedVedicUrl(candidate: string): boolean {
   try {
@@ -100,18 +107,26 @@ function getSearchUrl(query: string): string {
 }
 
 async function getBrowser() {
-  if (!browserPromise) {
-    browserPromise = chromium
+  if (!scraperGlobals.__shastraBrowser) {
+    scraperGlobals.__shastraBrowser = chromium
       .launch({ headless: true })
+      .then((browser) => {
+        // If Chromium dies, forget it (and the context that lived in it) so the next call relaunches.
+        browser.on("disconnected", () => {
+          scraperGlobals.__shastraBrowser = undefined;
+          scraperGlobals.__shastraContext = undefined;
+        });
+        return browser;
+      })
       .catch((error: unknown) => {
-        browserPromise = undefined;
+        scraperGlobals.__shastraBrowser = undefined;
         const detail = error instanceof Error ? error.message : String(error);
         throw new Error(
           `Playwright could not start Chromium. Install it with "npx playwright install chromium". ${detail}`,
         );
       });
   }
-  return browserPromise;
+  return scraperGlobals.__shastraBrowser;
 }
 
 const DEFAULT_STATE_PATH = ".auth/vedic-study.json";
@@ -133,7 +148,48 @@ export async function hasVedicAccess(): Promise<boolean> {
   }
 }
 
-async function getContext(): Promise<BrowserContext> {
+// One signed-in context is shared by every search and page read. Restoring the saved session
+// (cookies + IndexedDB) costs seconds, so it is done once; each call only opens its own page.
+
+function getContext(): Promise<BrowserContext> {
+  if (!scraperGlobals.__shastraContext) {
+    scraperGlobals.__shastraContext = createContext().catch((error: unknown) => {
+      scraperGlobals.__shastraContext = undefined;
+      throw error;
+    });
+  }
+  return scraperGlobals.__shastraContext;
+}
+
+/** Drops the shared context so the next call reloads the saved session file. */
+async function resetContext() {
+  const pending = scraperGlobals.__shastraContext;
+  scraperGlobals.__shastraContext = undefined;
+  await (await pending?.catch(() => undefined))?.close().catch(() => undefined);
+}
+
+/**
+ * The saved session's short-lived id token is usually expired by the time it is reused. The site's
+ * own script refreshes it (from the long-lived refresh token) when a page loads, so load one page
+ * first and wait for the refreshed token before the real work starts in parallel.
+ */
+async function warmUpSession(context: BrowserContext) {
+  const page = await context.newPage();
+  try {
+    await page.goto("https://www.vedic.study/", { waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS });
+    for (let waited = 0; waited < 12_000; waited += 500) {
+      const token = (await context.cookies()).find((cookie) => cookie.name === "firebase-token");
+      if (token && token.expires * 1000 > Date.now() + 10 * 60_000) return;
+      await page.waitForTimeout(500);
+    }
+  } catch {
+    /* the real request reports any problem */
+  } finally {
+    await page.close().catch(() => undefined);
+  }
+}
+
+async function createContext(): Promise<BrowserContext> {
   const browser = await getBrowser();
   const contextOptions: Parameters<Browser["newContext"]>[0] = {
     javaScriptEnabled: true,
@@ -153,6 +209,10 @@ async function getContext(): Promise<BrowserContext> {
   contextOptions.storageState = statePath;
 
   const context = await browser.newContext(contextOptions);
+  context.on("close", () => {
+    if (scraperGlobals.__shastraContext) scraperGlobals.__shastraContext = undefined;
+  });
+  await warmUpSession(context);
   const sessionStorageJson = process.env.VEDIC_STUDY_SESSION_STORAGE_JSON;
   if (sessionStorageJson) {
     let sessionStorage: Record<string, string>;
@@ -185,7 +245,15 @@ async function getContext(): Promise<BrowserContext> {
   return context;
 }
 
-async function openAllowedPage(context: BrowserContext, url: string) {
+/**
+ * The site is a client-rendered app that never goes network-idle, so waiting for idle just burns
+ * the timeout on every page. Wait for the content we need instead, and move on as soon as it is there.
+ */
+async function openAllowedPage(
+  context: BrowserContext,
+  url: string,
+  contentReady: (page: Page) => Promise<unknown>,
+) {
   if (!isAllowedVedicUrl(url)) {
     throw new Error("Only HTTPS pages on vedic.study can be opened.");
   }
@@ -218,9 +286,7 @@ async function openAllowedPage(context: BrowserContext, url: string) {
   }
 
   // The site is a client-rendered app: let it finish loading before reading.
-  await page
-    .waitForLoadState("networkidle", { timeout: SETTLE_TIMEOUT_MS })
-    .catch(() => undefined);
+  await contentReady(page).catch(() => undefined);
 
   if (isGatePath(new URL(page.url()).pathname)) {
     await page.close();
@@ -240,18 +306,37 @@ async function openAllowedPage(context: BrowserContext, url: string) {
   return page;
 }
 
+/** One retry for a gate bounce (a refresh may still be landing); a second one means the session is dead. */
+async function withGateRetry<T>(task: () => Promise<T>): Promise<T> {
+  try {
+    return await task();
+  } catch (error) {
+    if (!(error instanceof GateError)) throw error;
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+    try {
+      return await task();
+    } catch (retryError) {
+      if (retryError instanceof GateError) await resetContext(); // next call reloads the saved session
+      throw retryError;
+    }
+  }
+}
+
 export function searchVedicKnowledgeBase(query: string): Promise<SearchResult[]> {
   const key = `search:${query.trim().toLowerCase()}`;
-  return cached(key, () => pageLimiter.run(() => runSearch(query)));
+  return cached(key, () => pageLimiter.run(() => withGateRetry(() => runSearch(query))));
 }
 
 async function runSearch(query: string): Promise<SearchResult[]> {
   const context = await getContext();
   try {
-    const page = await openAllowedPage(context, getSearchUrl(query));
+    const page = await openAllowedPage(context, getSearchUrl(query), (p) =>
+      p.waitForSelector("article h3 a[href]", { timeout: SETTLE_TIMEOUT_MS }),
+    );
     try {
-      return await page.locator("body").evaluate(
-        (body, options) => {
+      return await page.evaluate(
+        (options) => {
+          const body = document.body;
           const clean = (text: string | null | undefined) =>
             (text || "").replace(/\s+/g, " ").trim();
           const isAllowed = (target: URL) =>
@@ -353,21 +438,30 @@ async function runSearch(query: string): Promise<SearchResult[]> {
       await page.close();
     }
   } finally {
-    await context.close();
+    // The context is shared across calls; only each call's page is closed.
+    void context;
   }
 }
 
 export function readVedicDocument(url: string): Promise<SourceDocument> {
-  if (!isAllowedVedicUrl(url)) {
+  // Always https, and www.vedic.study (the bare domain does not resolve).
+  const normalized = normalizeVedicUrl(url);
+  if (!normalized) {
     return Promise.reject(new Error("Only HTTPS vedic.study URLs can be read."));
   }
-  return cached(`doc:${url}`, () => pageLimiter.run(() => runRead(url)));
+  return cached(`doc:${normalized}`, () => pageLimiter.run(() => withGateRetry(() => runRead(normalized))));
 }
 
 async function runRead(url: string): Promise<SourceDocument> {
   const context = await getContext();
   try {
-    const page = await openAllowedPage(context, url);
+    const page = await openAllowedPage(context, url, (p) =>
+      p.waitForFunction(
+        () => ((document.querySelector("article, main") as HTMLElement | null)?.innerText.length ?? 0) > 200,
+        undefined,
+        { timeout: SETTLE_TIMEOUT_MS },
+      ),
+    );
     try {
       const loadedDocument = await page.evaluate((options) => {
         const { maxTextLength, maxLinks, allowedHost } = options;
@@ -456,6 +550,7 @@ async function runRead(url: string): Promise<SourceDocument> {
       await page.close();
     }
   } finally {
-    await context.close();
+    // The context is shared across calls; only each call's page is closed.
+    void context;
   }
 }

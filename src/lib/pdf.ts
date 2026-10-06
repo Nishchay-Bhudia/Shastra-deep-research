@@ -41,6 +41,8 @@ const STYLES = `
   code { font-family: ui-monospace, Menlo, monospace; font-size: 9.5pt; background: #f3eddc; padding: 0 3pt; border-radius: 3px; }
   pre { white-space: pre-wrap; }
   pre.mermaid { text-align: center; background: none; page-break-inside: avoid; }
+  .question { color: #4a4231; margin: 0 0 14pt; }
+  .diagram-failed { color: #8a7d5c; font-style: italic; }
   .meta { color: #8a7d5c; font-size: 9pt; margin-bottom: 14pt; }
   h2, h3 { page-break-after: avoid; }
 `;
@@ -48,13 +50,15 @@ const STYLES = `
 export async function renderReportPdf(options: {
   markdown: string;
   title: string;
-}): Promise<Buffer> {
+  subtitle?: string;
+}): Promise<{ pdf: Buffer; diagrams: { requested: number; rendered: number } }> {
   const body = await markdownToHtml(options.markdown);
   const date = new Date().toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
   const html = `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(options.title)}</title>
     <style>${STYLES}</style></head><body>
     <h1>${escapeHtml(options.title)}</h1>
     <div class="meta">Shastra research report · ${date} · Sources: vedic.study</div>
+    ${options.subtitle ? `<p class="question"><strong>Question:</strong> ${escapeHtml(options.subtitle)}</p>` : ""}
     ${body}</body></html>`;
 
   const browser = await chromium.launch({ headless: true });
@@ -62,7 +66,8 @@ export async function renderReportPdf(options: {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: "load" });
 
-    if (html.includes('class="mermaid"')) {
+    const requested = (html.match(/<pre class="mermaid">/g) ?? []).length;
+    if (requested > 0) {
       const mermaidPath = path.join(process.cwd(), "node_modules/mermaid/dist/mermaid.min.js");
       await page.addScriptTag({ content: await readFile(mermaidPath, "utf8") });
       await page.evaluate(async () => {
@@ -70,8 +75,15 @@ export async function renderReportPdf(options: {
         mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
         // A diagram that fails to parse stays as readable source text.
         await mermaid.run({ querySelector: "pre.mermaid", suppressErrors: true });
+        document.querySelectorAll("pre.mermaid:not([data-processed]), pre.mermaid:not(:has(svg))").forEach((node) => {
+          const note = document.createElement("p");
+          note.className = "diagram-failed";
+          note.textContent = "(A diagram could not be drawn here.)";
+          node.replaceWith(note);
+        });
       });
     }
+    const rendered = await page.locator("pre.mermaid svg").count();
 
     const pdf = await page.pdf({
       format: "A4",
@@ -82,7 +94,7 @@ export async function renderReportPdf(options: {
         '<div style="width:100%;font-size:8px;color:#8a7d5c;text-align:center;"><span class="pageNumber"></span> / <span class="totalPages"></span></div>',
       margin: { top: "22mm", bottom: "20mm", left: "18mm", right: "18mm" },
     });
-    return Buffer.from(pdf);
+    return { pdf: Buffer.from(pdf), diagrams: { requested, rendered } };
   } finally {
     await browser.close();
   }

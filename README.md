@@ -91,11 +91,14 @@ Sessions normally last a long time, but if the site revokes yours (for example a
 
 ## How the agent works
 
-- Parallel searches and full-page reads, with long pages paged through an `offset`, and same-site links returned from each page so the agent can follow commentary and parallel passages.
-- A `save_note` tool keeps findings and quotations across the whole run while older page text is compacted, which is what lets very deep runs continue without exhausting the model's context.
-- When the safety ceiling or time budget is reached, tools are switched off for one last step so a run always ends in a written report.
-- Citations are checked in the UI: links that no tool returned are tagged "unverified".
-- Search and page results are cached for ten minutes and browser use is limited to three concurrent pages.
+- **Thinks first.** Its first action is always `plan_research` (a descriptive report title, sub-questions, and search terms in English, IAST, Devanagari and Gujarati). It cannot write the report until `check_coverage` confirms every sub-question has saved evidence (a second check accepts gaps, which the report must then state). The plan is shown in the UI.
+- **Streams.** Progress and the report stream live; only the text written after the last tool call is shown, so tool-time chatter never leaks into the report.
+- **Evidence ledger.** `save_note` keeps findings and quotations (tied to a sub-question) across the whole run while older page text is compacted, which lets deep runs continue without exhausting the model's context. There is no fixed step limit; search/read budgets (standard 8/10, deep 20/30, exhaustive unlimited) and runaway ceilings only stop a small model from searching forever. At a ceiling or time budget, tools are switched off for a last step so a run always ends in a written report.
+- **Citations that work.** The model cites saved notes as `[3]`; the URL comes from the note, never from the model's memory. Every link is rewritten to its exact retrieved page as `https://www.vedic.study/...` (the bare `vedic.study` domain does not resolve); anything that cannot be matched to a retrieved page becomes plain text marked "unverified source", never a dead link. A numbered References list is generated from the pages actually cited.
+- **Grounded diagrams.** The model never writes diagram syntax. `create_diagram` takes nodes and relationships, each relationship must cite a page that was retrieved, and the Mermaid code is generated server-side (so it always parses). Hand-written diagram blocks are discarded.
+- **Deliverables.** Tick or untick *PDF report* and *Include diagrams* above the question box. With the PDF on, one is produced automatically at the end, named after the report title and date (for example `Dharma-and-Bhakti-in-Shikshapatri-and-Vachanamrut-2026-10-06.pdf`), with diagrams rendered in it.
+- **Chats.** *+ New chat* starts a fresh conversation; past chats are listed in the sidebar and stored in your browser's local storage (page text is not stored, only titles, links, notes, and the reports).
+- Search and page results are cached for ten minutes; one signed-in browser context is shared and at most three pages load at once.
 
 ## Research and source limitations
 
