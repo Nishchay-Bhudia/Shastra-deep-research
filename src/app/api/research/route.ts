@@ -189,6 +189,8 @@ export async function POST(request: NextRequest) {
       tools: getTools(notes),
       stopWhen: stepCountIs(ceiling),
       maxOutputTokens: 16_000,
+      // Low-cost API tiers rate-limit; retry with backoff instead of failing a long run.
+      maxRetries: 6,
       abortSignal: request.signal,
       prepareStep: ({ stepNumber, messages: stepMessages }) => {
         const { note, finalize } = getStepGuidance(
