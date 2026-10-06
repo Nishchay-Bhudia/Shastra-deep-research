@@ -5,6 +5,9 @@ import { DefaultChatTransport, type UIMessage } from "ai";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { GlassPanel } from "@/components/glass-panel";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
+import { PdfViewer } from "@/components/pdf-viewer";
+import { ThinkingWord } from "@/components/thinking-word";
+import { phaseFor } from "@/lib/research/thinking-words";
 import { compactForStorage } from "@/lib/chat-store";
 import { analyzeMessage, type MessageLike } from "@/lib/research/extract";
 import { finalizeReport, pdfFileName } from "@/lib/research/report";
@@ -58,6 +61,7 @@ export function ChatSession({
   const [pdfs, setPdfs] = useState<Record<string, PdfState>>({});
   const [notice, setNotice] = useState("");
   const [prefsLoaded, setPrefsLoaded] = useState(false);
+  const [viewing, setViewing] = useState<{ url: string; fileName: string } | null>(null);
 
   const transport = useMemo(() => new DefaultChatTransport({ api: "/api/research" }), []);
   const { messages, sendMessage, status, stop, error } = useChat({
@@ -292,17 +296,8 @@ export function ChatSession({
                 )}
                 {(live || analysis.counts.searches + analysis.counts.reads > 0) && (
                   <p className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-cream-700">
-                    {live && !hasReport && (
-                      <span className="flex items-center gap-2">
-                        <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-600" />
-                        {analysis.activity ?? (analysis.plan ? "Working" : "Thinking")}…
-                      </span>
-                    )}
-                    {live && hasReport && (
-                      <span className="flex items-center gap-2">
-                        <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-600" />
-                        Writing the report…
-                      </span>
+                    {live && (
+                      <ThinkingWord phase={phaseFor(analysis.activity, Boolean(analysis.plan), hasReport)} />
                     )}
                     <span>
                       {analysis.counts.searches} searches · {analysis.counts.reads} pages read · {analysis.counts.notes} notes
@@ -327,6 +322,13 @@ export function ChatSession({
                     {pdf?.status === "ready" && (
                       <>
                         <span className="min-w-0 truncate text-cream-900">{pdf.fileName}</span>
+                        <button
+                          type="button"
+                          onClick={() => setViewing({ url: pdf.url, fileName: pdf.fileName })}
+                          className="rounded-full border border-cream-400 bg-white/60 px-4 py-2 text-xs font-medium text-cream-900 transition hover:bg-white"
+                        >
+                          View PDF
+                        </button>
                         <a
                           href={pdf.url}
                           download={pdf.fileName}
@@ -408,6 +410,7 @@ export function ChatSession({
           </span>
         </div>
       </form>
+      {viewing && <PdfViewer url={viewing.url} fileName={viewing.fileName} onClose={() => setViewing(null)} />}
     </GlassPanel>
   );
 }

@@ -46,7 +46,7 @@ export function MarkdownRenderer({
                     title="This link was not returned by any search or page read in this run."
                     className="ml-1 rounded bg-amber-100 px-1 text-[10px] font-medium text-amber-900"
                   >
-                    unverified
+                    unverified link
                   </span>
                 )}
               </>

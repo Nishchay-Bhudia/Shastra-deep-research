@@ -75,11 +75,11 @@ export function finalizeReport({ markdown, sources, notes = new Map(), diagrams,
     try {
       host = new URL(url).hostname;
     } catch {
-      return `${label} (unverified source)`;
+      return `${label} (unverified link)`;
     }
     if (!isVedicHost(host)) return label; // the source boundary is vedic.study only
     const source = resolveSource(url, sources);
-    if (!source) return `${label} (unverified source)`;
+    if (!source) return `${label} (unverified link)`;
     cite(source);
     return `[${label}](${normalizeVedicUrl(source.url)})`;
   });

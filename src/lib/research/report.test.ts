@@ -32,7 +32,7 @@ describe("finalizeReport", () => {
 
   it("turns unmatched and off-site links into plain text, never dead links", () => {
     const out = finalize("[a](https://www.vedic.study/invented/page-that-never-existed) and [b](https://example.com/x)");
-    expect(out).toContain("a (unverified source)");
+    expect(out).toContain("a (unverified link)");
     expect(out).toContain("and b");
     expect(out).not.toContain("invented");
     expect(out).not.toContain("example.com");
