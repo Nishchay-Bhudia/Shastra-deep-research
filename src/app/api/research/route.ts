@@ -26,7 +26,7 @@ import {
 } from "@/lib/scraper/browser";
 
 export const runtime = "nodejs";
-export const maxDuration = 800;
+export const maxDuration = 300;
 
 const requestSchema = z.object({
   messages: z.array(z.unknown()).min(1).max(30),
