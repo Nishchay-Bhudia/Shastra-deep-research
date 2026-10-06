@@ -9,7 +9,7 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "capture:vedic-session": "node scripts/capture-vedic-session.mjs"
+    "login": "node scripts/login.mjs"
   },
   "dependencies": {
     "@ai-sdk/mistral": "^2.0.52",

@@ -3,7 +3,7 @@ import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Response } from "playwright";
 
 const TARGET_HOST = "vedic.study";
-const MAX_RESULTS = 12;
+const MAX_RESULTS = 15;
 const MAX_TEXT_LENGTH = 120_000;
 const MAX_LINKS = 40;
 const NAVIGATION_TIMEOUT_MS = 25_000;
@@ -55,18 +55,6 @@ class Semaphore {
 }
 
 const pageLimiter = new Semaphore(MAX_CONCURRENT_PAGES);
-
-async function withFreshSignIn<T>(task: () => Promise<T>): Promise<T> {
-  try {
-    return await task();
-  } catch (error) {
-    if (error instanceof GateError && hasLoginCredentials()) {
-      loginPromise = undefined; // session expired or was never accepted: sign in again once
-      return task();
-    }
-    throw error;
-  }
-}
 
 const cache = new Map<string, { expires: number; value: unknown }>();
 
@@ -126,119 +114,23 @@ async function getBrowser() {
   return browserPromise;
 }
 
-type StorageState = Awaited<ReturnType<BrowserContext["storageState"]>>;
+const DEFAULT_STATE_PATH = ".auth/vedic-study.json";
 
-const LOGIN_URL = "https://www.vedic.study/auth/login";
-const LOGIN_TIMEOUT_MS = 30_000;
-
-/** Raised when the site sends us to its invite gate; a fresh sign-in may fix it. */
+/** Raised when the site sends us to its invite gate: the saved session is missing or no longer valid. */
 class GateError extends Error {}
 
-let loginPromise: Promise<StorageState> | undefined;
-
-function hasLoginCredentials() {
-  return Boolean(process.env.VEDIC_STUDY_EMAIL && process.env.VEDIC_STUDY_PASSWORD);
+function getStatePath() {
+  return path.resolve(process.cwd(), process.env.VEDIC_STUDY_STORAGE_STATE_PATH || DEFAULT_STATE_PATH);
 }
 
-// Held on globalThis so every route bundle in this server process shares it.
-const CONNECTION_TTL_MS = 12 * 60 * 60_000;
-type Connection = { state: StorageState; expires: number };
-const globalStore = globalThis as unknown as { __vedicConnection?: Connection };
-
-function getConnection(): Connection | undefined {
-  const connection = globalStore.__vedicConnection;
-  if (connection && connection.expires <= Date.now()) {
-    globalStore.__vedicConnection = undefined;
-    return undefined;
-  }
-  return connection;
-}
-
-/** True when a signed-in session, configured credentials, or a state file is available. */
-export function hasVedicAccess(): boolean {
-  return Boolean(
-    getConnection() ||
-      hasLoginCredentials() ||
-      process.env.VEDIC_STUDY_STORAGE_STATE_PATH,
-  );
-}
-
-export function isVedicConnected(): boolean {
-  return hasVedicAccess();
-}
-
-export function disconnectVedic() {
-  globalStore.__vedicConnection = undefined;
-  loginPromise = undefined;
-  cache.clear();
-}
-
-/**
- * Signs in with credentials typed into the app. Only the resulting browser
- * state is kept (in memory); the password is discarded.
- */
-export async function connectVedic(email: string, password: string) {
-  const state = await signIn(email, password);
-  globalStore.__vedicConnection = { state, expires: Date.now() + CONNECTION_TTL_MS };
-  cache.clear();
-}
-
-/**
- * Signs in through the site's normal email form and returns the browser state
- * (cookies, local storage, IndexedDB) to reuse for research pages.
- */
-async function signIn(email: string, password: string): Promise<StorageState> {
-  const browser = await getBrowser();
-  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+/** True when the one-time `npm run login` session file exists. */
+export async function hasVedicAccess(): Promise<boolean> {
   try {
-    const page = await context.newPage();
-    page.setDefaultTimeout(LOGIN_TIMEOUT_MS);
-    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
-    await page.locator("input#email").fill(email);
-    await page.locator("input#password").fill(password);
-    await page.getByRole("button", { name: /^sign in$/i }).click();
-
-    try {
-      await page.waitForURL((url) => !/^\/auth\//.test(url.pathname), {
-        timeout: LOGIN_TIMEOUT_MS,
-      });
-    } catch {
-      // The site shows failures as an "Error" heading followed by the reason.
-      const pageText = await page.locator("body").innerText({ timeout: 1_000 }).catch(() => "");
-      const message = /\bError\s*\n+([^\n]{3,200})/.exec(pageText)?.[1] ?? "";
-      throw new Error(
-        `Signing in to vedic.study did not complete. ${
-          message ? `The site said: "${message.trim().slice(0, 200)}". ` : ""
-        }Check the email and password. Accounts that only use "Continue with Google/Apple" have no password; use the manual session capture instead.`,
-      );
-    }
-    await page.waitForLoadState("networkidle", { timeout: SETTLE_TIMEOUT_MS }).catch(() => undefined);
-
-    // A valid sign-in can still be an account that is not on the invite list.
-    await page.goto("https://www.vedic.study/", { waitUntil: "domcontentloaded" });
-    await page.waitForLoadState("networkidle", { timeout: SETTLE_TIMEOUT_MS }).catch(() => undefined);
-    if (isGatePath(new URL(page.url()).pathname)) {
-      throw new Error(
-        "You signed in, but vedic.study still shows its invite-only gate for this account. Use the email address that was invited.",
-      );
-    }
-    return await context.storageState({ indexedDB: true });
-  } finally {
-    await context.close();
+    await access(getStatePath());
+    return true;
+  } catch {
+    return false;
   }
-}
-
-function getLoginState(): Promise<StorageState> {
-  if (!loginPromise) {
-    loginPromise = signIn(
-      process.env.VEDIC_STUDY_EMAIL!,
-      process.env.VEDIC_STUDY_PASSWORD!,
-    ).catch((error: unknown) => {
-      loginPromise = undefined;
-      throw error;
-    });
-  }
-  return loginPromise;
 }
 
 async function getContext(): Promise<BrowserContext> {
@@ -250,23 +142,15 @@ async function getContext(): Promise<BrowserContext> {
     viewport: { width: 1440, height: 900 },
   };
 
-  const statePath = process.env.VEDIC_STUDY_STORAGE_STATE_PATH;
-  const connection = getConnection();
-  if (connection) {
-    contextOptions.storageState = connection.state;
-  } else if (hasLoginCredentials()) {
-    contextOptions.storageState = await getLoginState();
-  } else if (statePath) {
-    const resolvedPath = path.resolve(process.cwd(), statePath);
-    try {
-      await access(resolvedPath);
-      contextOptions.storageState = resolvedPath;
-    } catch {
-      throw new Error(
-        `The configured Playwright storage-state file was not found at ${resolvedPath}. Add an authorized state file or clear VEDIC_STUDY_STORAGE_STATE_PATH.`,
-      );
-    }
+  const statePath = getStatePath();
+  try {
+    await access(statePath);
+  } catch {
+    throw new Error(
+      "No saved vedic.study session was found. Run `npm run login` once to sign in; after that research runs on its own.",
+    );
   }
+  contextOptions.storageState = statePath;
 
   const context = await browser.newContext(contextOptions);
   const sessionStorageJson = process.env.VEDIC_STUDY_SESSION_STORAGE_JSON;
@@ -341,7 +225,7 @@ async function openAllowedPage(context: BrowserContext, url: string) {
   if (isGatePath(new URL(page.url()).pathname)) {
     await page.close();
     throw new GateError(
-      "vedic.study is invite-only and redirected to its sign-in gate. Reconnect your invited vedic.study account in the app (or capture a session with `npm run capture:vedic-session`); this app will not bypass the gate.",
+      "vedic.study sent the saved session to its invite-only sign-in gate, so the session has expired or was revoked. Run `npm run login` to sign in again; this app does not bypass the gate.",
     );
   }
 
@@ -358,7 +242,7 @@ async function openAllowedPage(context: BrowserContext, url: string) {
 
 export function searchVedicKnowledgeBase(query: string): Promise<SearchResult[]> {
   const key = `search:${query.trim().toLowerCase()}`;
-  return cached(key, () => pageLimiter.run(() => withFreshSignIn(() => runSearch(query))));
+  return cached(key, () => pageLimiter.run(() => runSearch(query)));
 }
 
 async function runSearch(query: string): Promise<SearchResult[]> {
@@ -368,6 +252,47 @@ async function runSearch(query: string): Promise<SearchResult[]> {
     try {
       return await page.locator("body").evaluate(
         (body, options) => {
+          const clean = (text: string | null | undefined) =>
+            (text || "").replace(/\s+/g, " ").trim();
+          const isAllowed = (target: URL) =>
+            target.protocol === "https:" &&
+            (target.hostname === options.allowedHost ||
+              target.hostname.endsWith(`.${options.allowedHost}`));
+
+          // vedic.study renders each hit as <article> with a breadcrumb, an <h3><a> title,
+          // and a highlighted snippet. Prefer that structure; it gives meaningful titles.
+          const cardResults: SearchResult[] = [];
+          const cardSeen = new Set<string>();
+          for (const card of Array.from(body.querySelectorAll("article"))) {
+            const anchor = card.querySelector<HTMLAnchorElement>("h3 a[href]");
+            if (!anchor) continue;
+            let target: URL;
+            try {
+              target = new URL(anchor.href);
+            } catch {
+              continue;
+            }
+            if (!isAllowed(target) || cardSeen.has(target.href)) continue;
+            const crumbs = Array.from(
+              card.querySelectorAll('ol[aria-label="Location"] li span:not([aria-hidden])'),
+            )
+              .map((node) => clean(node.textContent))
+              .filter(Boolean);
+            const heading = clean(anchor.textContent);
+            const kind = clean(card.querySelector("div.inline-flex")?.textContent);
+            const title = [...crumbs, heading].filter(Boolean).join(" › ").slice(0, 240);
+            const snippet = clean(card.querySelector("p")?.textContent).slice(0, 900);
+            cardSeen.add(target.href);
+            cardResults.push({
+              title: kind ? `${title} (${kind})` : title,
+              url: target.href,
+              snippet: snippet || title,
+            });
+            if (cardResults.length >= options.maxResults) break;
+          }
+          if (cardResults.length > 0) return cardResults;
+
+          // Fallback for pages that do not use the card layout.
           const links = Array.from(body.querySelectorAll<HTMLAnchorElement>("a[href]"));
           const seen = new Set<string>();
           const results: SearchResult[] = [];
@@ -436,7 +361,7 @@ export function readVedicDocument(url: string): Promise<SourceDocument> {
   if (!isAllowedVedicUrl(url)) {
     return Promise.reject(new Error("Only HTTPS vedic.study URLs can be read."));
   }
-  return cached(`doc:${url}`, () => pageLimiter.run(() => withFreshSignIn(() => runRead(url))));
+  return cached(`doc:${url}`, () => pageLimiter.run(() => runRead(url)));
 }
 
 async function runRead(url: string): Promise<SourceDocument> {

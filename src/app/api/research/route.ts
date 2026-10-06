@@ -151,9 +151,9 @@ export async function POST(request: NextRequest) {
       { status: 503 },
     );
   }
-  if (!hasVedicAccess()) {
+  if (!(await hasVedicAccess())) {
     return NextResponse.json(
-      { error: "Connect your vedic.study account first.", code: "vedic_not_connected" },
+      { error: "No saved vedic.study session. Run `npm run login` once in the project folder, then try again." },
       { status: 409 },
     );
   }

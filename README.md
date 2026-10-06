@@ -8,9 +8,9 @@ A private, source-grounded research workspace for investigating Vedic texts in E
 - Standard, Deep, and Really deep research modes. There is no fixed step limit: the agent keeps researching until its sub-questions are covered (runaway ceilings only, see `RESEARCH_MAX_STEPS` / `RESEARCH_MAX_MINUTES`).
 - One-click PDF download of any report (Devanagari, Gujarati, tables and diagrams included), rendered server-side with Chromium.
 - English and Gujarati report-language selection.
-- Mistral model integration (default `mistral-small-latest`, chosen for low cost) through the Vercel AI SDK. API keys remain on the server.
+- Mistral model integration (default `ministral-14b-latest`, chosen for low cost) through the Vercel AI SDK. API keys remain on the server.
 - Playwright search and article extraction, restricted to HTTPS URLs on `vedic.study` and its subdomains.
-- Optional Playwright storage state for a site account you are authorized to use.
+- One-time `npm run login` that saves your own signed-in session; the app then researches without further sign-in.
 - Devanagari and Gujarati script normalization with original text preserved beside a Latin transliteration.
 - Markdown reports with sanitized rendering, inline source links, and Mermaid diagrams.
 - Shared-password app access with signed, HTTP-only, 12-hour session cookies.
@@ -22,7 +22,7 @@ A private, source-grounded research workspace for investigating Vedic texts in E
 - A Mistral API key.
 - An app password and a random session-signing secret.
 - Chromium for Playwright. Install it with the command below.
-- An authorized `vedic.study` account only if the pages you need are gated.
+- An invited `vedic.study` account and Google Chrome (for the one-time `npm run login`).
 
 ## Local setup
 
@@ -46,20 +46,6 @@ Keep `.env.local` private; it is ignored by Git. For example, generate a session
 openssl rand -base64 48
 ```
 
-If `vedic.study` requires a signed-in session, capture it locally using an account you are permitted to use:
-
-```bash
-npm run capture:vedic-session
-```
-
-The helper opens a normal browser, lets you sign in yourself, and saves Playwright's cookies and local storage to `.auth/vedic-study.json`. This file contains sensitive session data: it is excluded from Git, must not be committed or shared, and must be transferred to the server only through a private file/secrets mechanism. Then set:
-
-```dotenv
-VEDIC_STUDY_STORAGE_STATE_PATH=.auth/vedic-study.json
-```
-
-If the site relies on session storage, configure the needed string-valued storage map using `VEDIC_STUDY_SESSION_STORAGE_JSON` in the deployment's secret manager. Do not place account credentials in source code. The scraper does not disguise automation, defeat a WAF, or circumvent an access denial; it reports access errors and expects valid authorization.
-
 Run the app:
 
 ```bash
@@ -81,12 +67,11 @@ npm run build
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `MISTRAL_API_KEY` | Yes for research | Server-side model API key |
-| `MISTRAL_MODEL` | No | Model name; defaults to `mistral-small-latest` (low cost, 262k context) |
+| `MISTRAL_MODEL` | No | Model name; defaults to `ministral-14b-latest` (low cost, 262k context) |
 | `APP_ACCESS_PASSWORD` | Yes | Shared sign-in password for this private instance |
 | `SESSION_SECRET` | Yes | Random secret of at least 32 characters for signed sessions |
-| `VEDIC_STUDY_EMAIL` / `VEDIC_STUDY_PASSWORD` | No | Invited account used for automatic sign-in |
 | `RESEARCH_MAX_STEPS` / `RESEARCH_MAX_MINUTES` | No | Runaway ceilings (defaults: 40/150/500 steps by depth, 60 minutes) |
-| `VEDIC_STUDY_STORAGE_STATE_PATH` | No | Server-side path to an authorized Playwright storage-state file |
+| `VEDIC_STUDY_STORAGE_STATE_PATH` | No | Session file written by `npm run login`; defaults to `.auth/vedic-study.json` |
 | `VEDIC_STUDY_SESSION_STORAGE_JSON` | No | Server-side JSON object for session storage values, if the site needs them |
 | `VEDIC_SEARCH_URL_TEMPLATE` | No | HTTPS search page template; `{query}` is URL-encoded |
 
@@ -94,22 +79,15 @@ The app is designed as a single private instance with one shared password, not a
 
 ## Access to vedic.study
 
-The site is invite-only: unauthenticated requests are redirected to a "Not Yet Open" sign-in gate, and the bare `vedic.study` domain does not resolve (use `www.vedic.study`). The app never tries to get around the gate; it signs in as you.
+The site is invite-only: unauthenticated requests are redirected to a "Not Yet Open" sign-in gate (and the bare `vedic.study` domain does not resolve; use `www.vedic.study`). The app never tries to get around the gate. Instead you sign in once, yourself, and it reuses that session.
 
-**Option 1 — enter it in the app (default).** After signing in with the app password, Shastra asks for your vedic.study email and password, signs in once, and keeps only the session in server memory (the password is discarded).
-
-**Option 2 — preconfigured credentials.** Put the email and password of your invited account in the server environment:
-
-```dotenv
-VEDIC_STUDY_EMAIL=you@example.com
-VEDIC_STUDY_PASSWORD=your-password
+```bash
+npm run login
 ```
 
-The server signs in once through the site's normal email form at `/auth/login`, keeps the session in memory, and signs in again by itself if it expires. Credentials stay server-side and are never sent to the browser or the model. This does not work for accounts that only use "Continue with Google/Apple".
+This opens your own Google Chrome with a dedicated profile (`~/.shastra-chrome`). Sign in to vedic.study there the way you normally do, Google included. Google blocks sign-in inside automated browsers, which is why the script attaches to real Chrome instead. As soon as it sees you are signed in, it saves the session (cookies plus the site's Firebase sign-in from IndexedDB) to `.auth/vedic-study.json` and exits. After that, research runs on its own with no further sign-in; there is no password prompt in the app.
 
-**Option 3 — captured session.** Run `npm run capture:vedic-session`, sign in yourself in the window that opens (any method, including Google), and the saved state is used for research.
-
-The search-result selectors have not been verified against signed-in pages, so check a first search before relying on the agent.
+Sessions normally last a long time, but if the site revokes yours (for example after a password change) research reports that the session expired; run `npm run login` again. `.auth/` is excluded from Git; never commit or share that file. For a deployed server, transfer it through a private secrets mechanism and set `VEDIC_STUDY_STORAGE_STATE_PATH`.
 
 ## How the agent works
 

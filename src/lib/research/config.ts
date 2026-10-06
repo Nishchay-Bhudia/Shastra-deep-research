@@ -1,8 +1,9 @@
 export type Depth = "standard" | "deep" | "really-deep";
 export type Language = "English" | "Gujarati";
 
-// Low-cost model with reliable tool calling and a 262k-token context.
-export const DEFAULT_MODEL = "mistral-small-latest";
+// Low-cost model with tool calling and a 262k-token context. Chosen because the project's
+// API key can call it (mistral-small/medium return 429 with a 0 requests/minute limit on it).
+export const DEFAULT_MODEL = "ministral-14b-latest";
 
 /**
  * Research is not capped at a fixed number of steps: the agent keeps going
