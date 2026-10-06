@@ -203,11 +203,9 @@ async function signIn(email: string, password: string): Promise<StorageState> {
         timeout: LOGIN_TIMEOUT_MS,
       });
     } catch {
-      const message = await page
-        .locator('[role="alert"], .error, [class*="error"]')
-        .first()
-        .innerText({ timeout: 1_000 })
-        .catch(() => "");
+      // The site shows failures as an "Error" heading followed by the reason.
+      const pageText = await page.locator("body").innerText({ timeout: 1_000 }).catch(() => "");
+      const message = /\bError\s*\n+([^\n]{3,200})/.exec(pageText)?.[1] ?? "";
       throw new Error(
         `Signing in to vedic.study did not complete. ${
           message ? `The site said: "${message.trim().slice(0, 200)}". ` : ""
