@@ -2,12 +2,10 @@
 
 import type { UIMessage } from "ai";
 import { useEffect, useState } from "react";
-import { ChatSession } from "@/components/chat-session";
+import { ChatSession, type StoredPdfs } from "@/components/chat-session";
 import {
   detectStorage,
-  loadActiveChatId,
   newChatId,
-  saveActiveChatId,
   type ChatMeta,
   type ChatStorage,
 } from "@/lib/chat-store";
@@ -21,7 +19,7 @@ function titleFrom(messages: UIMessage[], fallback: string) {
   return text ? text.slice(0, 70) : fallback;
 }
 
-type Entry = ChatMeta & { messages: UIMessage[] | null };
+type Entry = ChatMeta & { messages: UIMessage[] | null; pdfs?: StoredPdfs };
 
 export function ResearchDashboard() {
   const [storage, setStorage] = useState<ChatStorage | null>(null);
@@ -39,15 +37,10 @@ export function ResearchDashboard() {
       const metas = await chosen.list().catch(() => [] as ChatMeta[]);
       if (cancelled) return;
       setStorage(chosen);
-      const saved = loadActiveChatId();
-      if (metas.length > 0) {
-        setChats(metas.map((meta) => ({ ...meta, messages: null })));
-        setActiveId(metas.some((meta) => meta.id === saved) ? saved! : metas[0].id);
-      } else {
-        const first = blank();
-        setChats([first]);
-        setActiveId(first.id);
-      }
+      // Every visit (including a refresh) opens a fresh chat; earlier chats stay in the sidebar.
+      const fresh = blank();
+      setChats([fresh, ...metas.map((meta) => ({ ...meta, messages: null }))]);
+      setActiveId(fresh.id);
     })();
     return () => {
       cancelled = true;
@@ -55,19 +48,15 @@ export function ResearchDashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    if (activeId) saveActiveChatId(activeId);
-  }, [activeId]);
-
   // Chats from the server list arrive without messages; fetch the one being opened.
   useEffect(() => {
     if (!storage || !chats) return;
     const active = chats.find((chat) => chat.id === activeId);
     if (!active || active.messages !== null) return;
     let cancelled = false;
-    storage.load(active.id).then((messages) => {
+    storage.load(active.id).then(({ messages, pdfs }) => {
       if (cancelled) return;
-      setChats((current) => current?.map((chat) => (chat.id === active.id ? { ...chat, messages } : chat)) ?? current);
+      setChats((current) => current?.map((chat) => (chat.id === active.id ? { ...chat, messages, pdfs } : chat)) ?? current);
     });
     return () => {
       cancelled = true;
@@ -97,15 +86,17 @@ export function ResearchDashboard() {
     if (id === activeId) setActiveId(next[0].id);
   }
 
-  function updateMessages(id: string, messages: UIMessage[]) {
+  function updateChat(id: string, state: { messages: UIMessage[]; pdfs: StoredPdfs }) {
     if (!storage) return;
     const existing = chats?.find((chat) => chat.id === id);
-    const title = titleFrom(messages, existing?.title ?? "New chat");
+    const title = titleFrom(state.messages, existing?.title ?? "New chat");
     const updatedAt = Date.now();
-    setChats((current) => current?.map((chat) => (chat.id === id ? { ...chat, messages, title, updatedAt } : chat)) ?? current);
-    if (messages.length > 0) {
+    setChats((current) => current?.map((chat) => (chat.id === id ? { ...chat, ...state, title, updatedAt } : chat)) ?? current);
+    if (state.messages.length > 0) {
       setSaveError("");
-      void storage.save({ id, title, updatedAt, messages }).catch(() => setSaveError("Could not save this chat; it will be lost on reload."));
+      void storage
+        .save({ id, title, updatedAt, messages: state.messages, pdfs: state.pdfs })
+        .catch(() => setSaveError("Could not save this chat; it will be lost on reload."));
     }
   }
 
@@ -210,7 +201,8 @@ export function ResearchDashboard() {
                 key={active.id}
                 chatId={active.id}
                 initialMessages={active.messages}
-                onMessages={(messages) => updateMessages(active.id, messages)}
+                initialPdfs={active.pdfs ?? {}}
+                onChange={(state) => updateChat(active.id, state)}
               />
             )}
           </div>

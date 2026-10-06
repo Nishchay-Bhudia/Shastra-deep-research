@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { renderReportPdf } from "@/lib/pdf";
+import { blobConfigured, isValidChatId, savePdf } from "@/lib/chat-server";
 import { pdfFileName } from "@/lib/research/report";
 
 export const runtime = "nodejs";
@@ -10,6 +11,8 @@ const bodySchema = z.object({
   markdown: z.string().min(1).max(300_000),
   title: z.string().min(1).max(200).default("Research report"),
   subtitle: z.string().max(500).optional(),
+  chatId: z.string().optional(),
+  messageId: z.string().optional(),
 });
 
 export async function POST(request: NextRequest) {
@@ -30,6 +33,18 @@ export async function POST(request: NextRequest) {
       console.warn(`PDF: ${diagrams.requested - diagrams.rendered} of ${diagrams.requested} diagrams did not render.`);
     }
     const name = pdfFileName(parsed.data.title);
+
+    // When the deployment has storage, keep the PDF so it is still there after a reload; the client
+    // then previews and downloads it from /api/pdfs/... instead of holding the bytes itself.
+    const { chatId, messageId } = parsed.data;
+    if (blobConfigured() && chatId && messageId && isValidChatId(chatId) && isValidChatId(messageId)) {
+      await savePdf(chatId, messageId, pdf);
+      return NextResponse.json({
+        stored: true,
+        fileName: name,
+        url: `/api/pdfs/${chatId}/${messageId}?name=${encodeURIComponent(name)}`,
+      });
+    }
     return new NextResponse(new Uint8Array(pdf), {
       headers: {
         "Content-Type": "application/pdf",

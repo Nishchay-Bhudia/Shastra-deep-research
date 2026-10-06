@@ -58,6 +58,17 @@ type RunState = {
   searches: number;
   reads: number;
   diagramAttempts: number;
+  analysis?: Analysis;
+  analysisAttempts: number;
+};
+
+type Analysis = {
+  thesis: string;
+  findings: { subQuestion: number; claim: string; reasoning: string; confidence: string; noteNumbers: number[] }[];
+  relationships: { kind: string; description: string; noteNumbers: number[] }[];
+  tensions: string[];
+  gaps: string[];
+  outline: string[];
 };
 
 /**
@@ -65,14 +76,14 @@ type RunState = {
  * will happily search forever; reading pages is where the evidence is. Exhaustive runs are uncapped.
  */
 function getSearchBudget(depth: "standard" | "deep" | "really-deep"): number {
-  if (depth === "standard") return 8;
-  if (depth === "deep") return 20;
+  if (depth === "standard") return 12;
+  if (depth === "deep") return 25;
   return Number.POSITIVE_INFINITY;
 }
 
 function getReadBudget(depth: "standard" | "deep" | "really-deep"): number {
-  if (depth === "standard") return 10;
-  if (depth === "deep") return 30;
+  if (depth === "standard") return 16;
+  if (depth === "deep") return 40;
   return Number.POSITIVE_INFINITY;
 }
 
@@ -116,6 +127,17 @@ function formatLedger(state: RunState): string {
     text += `\n\nRESEARCH PLAN (report title: "${state.plan.reportTitle}")\n${state.plan.subQuestions
       .map((question, index) => `Q${index + 1}. ${question}`)
       .join("\n")}\nSearch terms: ${state.plan.searchTerms.join("; ")}`;
+  }
+  if (state.analysis) {
+    const a = state.analysis;
+    const refs = (numbers: number[]) => (numbers.length ? ` [${numbers.join(", ")}]` : "");
+    text += `\n\nYOUR ANALYSIS (write the report from this; cite the note numbers shown)\nThesis: ${a.thesis}\n${a.findings
+      .map((f) => `- Q${f.subQuestion} (${f.confidence}): ${f.claim} — ${f.reasoning}${refs(f.noteNumbers)}`)
+      .join("\n")}${
+      a.relationships.length ? `\nHow the sources relate:\n${a.relationships.map((r) => `- ${r.kind}: ${r.description}${refs(r.noteNumbers)}`).join("\n")}` : ""
+    }${a.tensions.length ? `\nTensions: ${a.tensions.join(" | ")}` : ""}${a.gaps.length ? `\nGaps: ${a.gaps.join(" | ")}` : ""}${
+      a.outline.length ? `\nReport outline: ${a.outline.join(" → ")}` : ""
+    }`;
   }
   if (state.notes.length > 0) {
     const lines = state.notes
@@ -263,8 +285,8 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
           url: canonical,
           title: entry.title.slice(0, 300),
           subQuestion: entry.subQuestion,
-          note: entry.note.slice(0, 1_500),
-          quote: entry.quote?.slice(0, 1_500),
+          note: entry.note.slice(0, 2_000),
+          quote: entry.quote?.slice(0, 2_500),
         });
         // The number is what the report cites, e.g. [3]; the system turns it into a verified link.
         return {
@@ -301,6 +323,65 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
               : `Proceeding with gaps in Q${gaps.map((g) => g.id).join(", Q")}: state them plainly under limitations. You may now write the report.`
             : `No notes yet for Q${gaps.map((g) => g.id).join(", Q")}. Research them (or call check_coverage again to accept the gap), then continue.`,
         };
+      },
+    }),
+    analyze_evidence: tool({
+      description:
+        "After check_coverage confirms readiness and before writing: state your thesis, what the evidence for each sub-question shows (with the supporting note numbers), how the sources relate, the tensions you found, what is still unanswered, and an outline for the report.",
+      inputSchema: z.object({
+        thesis: z.string().min(1).describe("The single most important, specific answer your evidence supports."),
+        findings: z
+          .array(
+            z.object({
+              subQuestion: z.number().int().min(1),
+              claim: z.string().min(1),
+              reasoning: z.string().min(1).describe("Why the cited notes support the claim and what follows from it."),
+              confidence: z.string().default("medium").describe('"high", "medium" or "low".'),
+              noteNumbers: z.array(z.number().int()).default([]),
+            }),
+          )
+          .min(1),
+        relationships: z
+          .array(
+            z.object({
+              kind: z.string().min(1).describe("agrees, qualifies, contradicts, develops, or a short label of your own."),
+              description: z.string().min(1),
+              noteNumbers: z.array(z.number().int()).default([]),
+            }),
+          )
+          .default([]),
+        tensions: z.array(z.string()).default([]),
+        gaps: z.array(z.string()).default([]),
+        outline: z.array(z.string()).default([]).describe("Headings of the report, in order."),
+      }),
+      execute: async (input) => {
+        if (!state.readyToWrite) return { error: "Finish the research and call check_coverage before analysing." };
+        state.analysisAttempts += 1;
+        const cited = [...input.findings.flatMap((f) => f.noteNumbers), ...input.relationships.flatMap((r) => r.noteNumbers)];
+        const missing = [...new Set(cited.filter((n) => n < 1 || n > state.notes.length))];
+        if (missing.length > 0 && state.analysisAttempts < 3) {
+          return { error: `Note numbers ${missing.join(", ")} do not exist (there are ${state.notes.length} notes). Cite only saved notes.` };
+        }
+        const valid = (numbers: number[]) => numbers.filter((n) => n >= 1 && n <= state.notes.length);
+        state.analysis = {
+          thesis: input.thesis.slice(0, 1_200),
+          findings: input.findings.slice(0, 12).map((f) => ({
+            subQuestion: f.subQuestion,
+            claim: f.claim.slice(0, 700),
+            reasoning: f.reasoning.slice(0, 1_000),
+            confidence: f.confidence.slice(0, 20),
+            noteNumbers: valid(f.noteNumbers),
+          })),
+          relationships: input.relationships.slice(0, 12).map((r) => ({
+            kind: r.kind.slice(0, 40),
+            description: r.description.slice(0, 700),
+            noteNumbers: valid(r.noteNumbers),
+          })),
+          tensions: input.tensions.slice(0, 8).map((t) => t.slice(0, 500)),
+          gaps: input.gaps.slice(0, 8).map((g) => g.slice(0, 400)),
+          outline: input.outline.slice(0, 14).map((o) => o.slice(0, 120)),
+        };
+        return { analysed: true, findings: state.analysis.findings.length, tensions: state.analysis.tensions.length };
       },
     }),
     create_diagram: tool({
@@ -385,6 +466,7 @@ export async function POST(request: NextRequest) {
     searches: 0,
     reads: 0,
     diagramAttempts: 0,
+    analysisAttempts: 0,
   };
   const baseSystem = buildSystemPrompt(parsed.data.language, depth, deliverables);
   const modelName = process.env.MISTRAL_MODEL || DEFAULT_MODEL;
@@ -428,6 +510,10 @@ export async function POST(request: NextRequest) {
         if (finalize) return { system, messages, toolChoice: "none" as const };
         // Coverage confirmed: optionally draw grounded diagrams, then write.
         if (state.readyToWrite) {
+          // Reason over the evidence before writing (a few tries if the first is rejected).
+          if (!state.analysis && state.analysisAttempts < 3) {
+            return { system, messages, toolChoice: { type: "tool" as const, toolName: "analyze_evidence" as const } };
+          }
           const canDraw = deliverables.diagrams && state.diagrams.length < MAX_DIAGRAMS;
           if (!canDraw) return { system, messages, toolChoice: "none" as const };
           // The reader asked for diagrams: make sure at least one real one exists (a few tries if the

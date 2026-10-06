@@ -25,6 +25,7 @@ const ACTIVITY: Record<string, string> = {
   read_document: "Reading a source",
   save_note: "Taking notes",
   check_coverage: "Checking coverage",
+  analyze_evidence: "Analysing the evidence",
   create_diagram: "Drawing a diagram",
 };
 

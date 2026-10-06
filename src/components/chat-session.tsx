@@ -17,8 +17,13 @@ type Language = "English" | "Gujarati";
 type Deliverables = { pdf: boolean; diagrams: boolean };
 type PdfState =
   | { status: "working" }
-  | { status: "ready"; url: string; fileName: string }
+  | { status: "ready"; url: string; fileName: string; stored: boolean }
   | { status: "error"; message: string };
+
+export type StoredPdfs = Record<string, { fileName: string }>;
+
+const pdfUrl = (chatId: string, messageId: string, fileName: string) =>
+  `/api/pdfs/${chatId}/${messageId}?name=${encodeURIComponent(fileName)}`;
 
 const depthOptions: { value: Depth; label: string; detail: string }[] = [
   { value: "standard", label: "Standard", detail: "Quick, focused answer" },
@@ -48,17 +53,27 @@ function plainText(message: MessageLike) {
 export function ChatSession({
   chatId,
   initialMessages,
-  onMessages,
+  initialPdfs,
+  onChange,
 }: {
   chatId: string;
   initialMessages: UIMessage[];
-  onMessages: (messages: UIMessage[]) => void;
+  /** Reports whose PDF was stored on the server in an earlier visit; shown again after a reload. */
+  initialPdfs: StoredPdfs;
+  onChange: (state: { messages: UIMessage[]; pdfs: StoredPdfs }) => void;
 }) {
   const [draft, setDraft] = useState("");
   const [depth, setDepth] = useState<Depth>("deep");
   const [language, setLanguage] = useState<Language>("English");
   const [deliverables, setDeliverables] = useState<Deliverables>({ pdf: true, diagrams: true });
-  const [pdfs, setPdfs] = useState<Record<string, PdfState>>({});
+  const [pdfs, setPdfs] = useState<Record<string, PdfState>>(() =>
+    Object.fromEntries(
+      Object.entries(initialPdfs).map(([messageId, info]) => [
+        messageId,
+        { status: "ready", url: pdfUrl(chatId, messageId, info.fileName), fileName: info.fileName, stored: true } as PdfState,
+      ]),
+    ),
+  );
   const [notice, setNotice] = useState("");
   const [prefsLoaded, setPrefsLoaded] = useState(false);
   const [viewing, setViewing] = useState<{ url: string; fileName: string } | null>(null);
@@ -88,9 +103,23 @@ export function ChatSession({
     }
   }, [depth, language, deliverables, prefsLoaded]);
 
-  // Persist the conversation once a response has finished (not on every streamed token).
+  // Persist the conversation (and which reports have a stored PDF) once a response has finished,
+  // not on every streamed token.
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const storedPdfs = (current: Record<string, PdfState>): StoredPdfs =>
+    Object.fromEntries(
+      Object.entries(current)
+        .filter((entry): entry is [string, Extract<PdfState, { status: "ready" }>] => entry[1].status === "ready" && entry[1].stored)
+        .map(([messageId, pdf]) => [messageId, { fileName: pdf.fileName }]),
+    );
+  function persist(current: Record<string, PdfState>) {
+    if (messagesRef.current.length > 0) {
+      onChange({ messages: compactForStorage(messagesRef.current), pdfs: storedPdfs(current) });
+    }
+  }
   useEffect(() => {
-    if (status === "ready" && messages.length > 0) onMessages(compactForStorage(messages));
+    if (status === "ready") persist(pdfsRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
 
@@ -102,7 +131,7 @@ export function ChatSession({
   useEffect(
     () => () => {
       stopRef.current();
-      Object.values(pdfsRef.current).forEach((pdf) => pdf.status === "ready" && URL.revokeObjectURL(pdf.url));
+      Object.values(pdfsRef.current).forEach((pdf) => pdf.status === "ready" && !pdf.stored && URL.revokeObjectURL(pdf.url));
     },
     [],
   );
@@ -125,24 +154,38 @@ export function ChatSession({
     const questionText = question ? plainText(question as MessageLike) : "";
     const title = analysis.plan?.reportTitle || questionText.slice(0, 120) || "Research report";
     setPdfs((current) => ({ ...current, [message.id]: { status: "working" } }));
-    try {
-      const response = await fetch("/api/export/pdf", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ markdown, title, subtitle: questionText.slice(0, 400) }),
-      });
-      if (!response.ok) {
-        const data = (await response.json().catch(() => ({}))) as { error?: string };
-        throw new Error(data.error || "Could not create the PDF.");
+
+    let lastError = "Could not create the PDF.";
+    // One automatic retry: PDF rendering occasionally fails on a cold server.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const response = await fetch("/api/export/pdf", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ markdown, title, subtitle: questionText.slice(0, 400), chatId, messageId: message.id }),
+        });
+        if (!response.ok) {
+          const data = (await response.json().catch(() => ({}))) as { error?: string };
+          throw new Error(data.error || "Could not create the PDF.");
+        }
+        const ready: PdfState = (response.headers.get("content-type") || "").includes("application/json")
+          ? await response.json().then((data: { fileName: string; url: string }) => ({
+              status: "ready" as const,
+              url: data.url,
+              fileName: data.fileName,
+              stored: true,
+            }))
+          : { status: "ready", url: URL.createObjectURL(await response.blob()), fileName: pdfFileName(title), stored: false };
+        const next = { ...pdfsRef.current, [message.id]: ready };
+        pdfsRef.current = next;
+        setPdfs(next);
+        persist(next);
+        return;
+      } catch (pdfError) {
+        lastError = pdfError instanceof Error ? pdfError.message : lastError;
       }
-      const url = URL.createObjectURL(await response.blob());
-      setPdfs((current) => ({ ...current, [message.id]: { status: "ready", url, fileName: pdfFileName(title) } }));
-    } catch (pdfError) {
-      setPdfs((current) => ({
-        ...current,
-        [message.id]: { status: "error", message: pdfError instanceof Error ? pdfError.message : "Could not create the PDF." },
-      }));
     }
+    setPdfs((current) => ({ ...current, [message.id]: { status: "error", message: lastError } }));
   }
 
   // At the end of a run, produce the PDF automatically when that deliverable is selected.
@@ -307,19 +350,15 @@ export function ChatSession({
                 )}
                 {hasReport ? <MarkdownRenderer content={markdown} /> : <span className="sr-only">Research in progress</span>}
 
-                {hasReport && !live && deliverables.pdf && (
+                {hasReport && !live && pdf && (
                   <div className="mt-5 flex flex-wrap items-center gap-3 rounded-2xl border border-cream-300 bg-white/45 px-4 py-3 text-sm">
-                    {(!pdf || pdf.status === "working") && (
+                    {pdf.status === "working" && (
                       <span className="flex items-center gap-2 text-cream-700">
                         <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-600" />
-                        {pdf ? "Creating your PDF…" : (
-                          <button type="button" onClick={() => void createPdf(message, index)} className="underline">
-                            Create PDF
-                          </button>
-                        )}
+                        Creating your PDF…
                       </span>
                     )}
-                    {pdf?.status === "ready" && (
+                    {pdf.status === "ready" && (
                       <>
                         <span className="min-w-0 truncate text-cream-900">{pdf.fileName}</span>
                         <button
@@ -338,14 +377,7 @@ export function ChatSession({
                         </a>
                       </>
                     )}
-                    {pdf?.status === "error" && (
-                      <>
-                        <span className="text-red-900">{pdf.message}</span>
-                        <button type="button" onClick={() => void createPdf(message, index)} className="underline">
-                          Try again
-                        </button>
-                      </>
-                    )}
+                    {pdf.status === "error" && <span className="text-red-900">{pdf.message}</span>}
                   </div>
                 )}
               </article>

@@ -1,7 +1,9 @@
-import { blobConfigured, readJson, removeBlob, writeJson } from "@/lib/blob";
+import { put } from "@vercel/blob";
+import { blobConfigured, listPaths, readJson, removeBlob, writeJson } from "@/lib/blob";
 
 export type ChatMeta = { id: string; title: string; updatedAt: number };
-export type ChatRecord = ChatMeta & { messages: unknown[] };
+export type PdfInfo = { fileName: string };
+export type ChatRecord = ChatMeta & { messages: unknown[]; pdfs?: Record<string, PdfInfo> };
 
 const INDEX = "chats/index.json";
 const MAX_CHATS = 100;
@@ -9,6 +11,7 @@ const ID = /^[A-Za-z0-9_-]{8,64}$/;
 
 export const isValidChatId = (id: string) => ID.test(id);
 export const chatPath = (id: string) => `chats/${id}.json`;
+export const pdfPath = (chatId: string, messageId: string) => `pdfs/${chatId}/${messageId}.pdf`;
 export { blobConfigured };
 
 export async function listChats(): Promise<ChatMeta[]> {
@@ -34,7 +37,20 @@ export async function saveChat(chat: ChatRecord) {
   }
 }
 
+export async function savePdf(chatId: string, messageId: string, pdf: Buffer) {
+  await put(pdfPath(chatId, messageId), pdf, {
+    access: "private",
+    contentType: "application/pdf",
+    addRandomSuffix: false,
+    allowOverwrite: true,
+  });
+}
+
 export async function deleteChat(id: string) {
+  // The chat's PDFs go with it.
+  for (const path of await listPaths(`pdfs/${id}/`).catch(() => [] as string[])) {
+    await removeBlob(path).catch(() => undefined);
+  }
   const index = (await readJson<ChatMeta[]>(INDEX)) ?? [];
   await writeJson(INDEX, index.filter((entry) => entry.id !== id));
   await removeBlob(chatPath(id)).catch(() => undefined);

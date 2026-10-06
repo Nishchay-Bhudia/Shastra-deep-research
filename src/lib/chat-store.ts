@@ -5,6 +5,8 @@ export type StoredChat = {
   title: string;
   updatedAt: number;
   messages: UIMessage[];
+  /** Reports whose PDF is stored on the server, by assistant message id. */
+  pdfs?: Record<string, { fileName: string }>;
 };
 
 const CHATS_KEY = "shastra.chats.v1";
@@ -94,7 +96,7 @@ export type ChatMeta = { id: string; title: string; updatedAt: number };
 export interface ChatStorage {
   kind: "server" | "browser";
   list(): Promise<ChatMeta[]>;
-  load(id: string): Promise<UIMessage[]>;
+  load(id: string): Promise<{ messages: UIMessage[]; pdfs: Record<string, { fileName: string }> }>;
   save(chat: StoredChat): Promise<void>;
   remove(id: string): Promise<void>;
 }
@@ -105,7 +107,7 @@ const browserStorage: ChatStorage = {
     return loadChats().map(({ id, title, updatedAt }) => ({ id, title, updatedAt }));
   },
   async load(id) {
-    return loadChats().find((chat) => chat.id === id)?.messages ?? [];
+    return { messages: loadChats().find((chat) => chat.id === id)?.messages ?? [], pdfs: {} };
   },
   async save(chat) {
     saveChats([chat, ...loadChats().filter((existing) => existing.id !== chat.id)]);
@@ -124,14 +126,15 @@ const serverStorage: ChatStorage = {
   },
   async load(id) {
     const response = await fetch(`/api/chats/${id}`);
-    if (!response.ok) return [];
-    return ((await response.json()) as { messages: UIMessage[] }).messages;
+    if (!response.ok) return { messages: [], pdfs: {} };
+    const data = (await response.json()) as { messages: UIMessage[]; pdfs?: Record<string, { fileName: string }> };
+    return { messages: data.messages, pdfs: data.pdfs ?? {} };
   },
   async save(chat) {
     const response = await fetch(`/api/chats/${chat.id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: chat.title, messages: chat.messages }),
+      body: JSON.stringify({ title: chat.title, messages: chat.messages, pdfs: chat.pdfs }),
     });
     if (!response.ok) throw new Error("Could not save the chat.");
   },

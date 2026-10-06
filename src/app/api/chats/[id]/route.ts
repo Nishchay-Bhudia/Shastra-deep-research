@@ -7,6 +7,7 @@ export const runtime = "nodejs";
 const bodySchema = z.object({
   title: z.string().min(1).max(200),
   messages: z.array(z.unknown()).max(200),
+  pdfs: z.record(z.string(), z.object({ fileName: z.string().max(300) })).optional(),
 });
 
 type Context = { params: Promise<{ id: string }> };
@@ -40,7 +41,7 @@ export async function PUT(request: NextRequest, context: Context) {
   const parsed = bodySchema.safeParse(await request.json().catch(() => undefined));
   if (!parsed.success) return NextResponse.json({ error: "Invalid chat." }, { status: 400 });
   try {
-    await saveChat({ id: checked.id, title: parsed.data.title, messages: parsed.data.messages, updatedAt: Date.now() });
+    await saveChat({ id: checked.id, title: parsed.data.title, messages: parsed.data.messages, pdfs: parsed.data.pdfs, updatedAt: Date.now() });
     return NextResponse.json({ ok: true });
   } catch (error) {
     console.error("Saving chat failed:", error);

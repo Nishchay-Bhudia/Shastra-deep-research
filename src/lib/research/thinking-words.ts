@@ -2,7 +2,7 @@
  * Playful status words shown while the agent works, keyed by what it is doing.
  * Gujarati ones are written in Latin script ("vaachu chhu" = "I am reading").
  */
-export type Phase = "thinking" | "planning" | "searching" | "reading" | "noting" | "checking" | "drawing" | "writing";
+export type Phase = "analysing" | "thinking" | "planning" | "searching" | "reading" | "noting" | "checking" | "drawing" | "writing";
 
 const WORDS: Record<Phase, string[]> = {
   thinking: ["Thinking", "Vichaaru chhu", "Pondering", "Gathering thoughts"],
@@ -10,6 +10,7 @@ const WORDS: Record<Phase, string[]> = {
   searching: ["Scurrying through the shelves", "Shodhu chhu", "Searching", "Hunting for passages", "Rummaging"],
   reading: ["Reading", "Vaachu chhu", "Studying", "Poring over the text", "Absorbing"],
   noting: ["Jotting notes", "Noto karu chhu", "Noting it down", "Marking the key lines"],
+  analysing: ["Analysing", "Weighing the evidence", "Connecting the threads", "Taali jou chhu", "Finding the argument"],
   checking: ["Analysing", "Taali jou chhu", "Cross-checking", "Weighing the evidence"],
   drawing: ["Sketching a diagram", "Doru chhu", "Connecting the dots"],
   writing: ["Writing it up", "Lakhu chhu", "Composing", "Bringing it together"],
@@ -33,6 +34,8 @@ export function phaseFor(activity: string | undefined, hasPlan: boolean, writing
       return "noting";
     case "Checking coverage":
       return "checking";
+    case "Analysing the evidence":
+      return "analysing";
     case "Drawing a diagram":
       return "drawing";
     default:
