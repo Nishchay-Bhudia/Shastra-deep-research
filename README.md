@@ -8,7 +8,7 @@ A private, source-grounded research workspace for investigating Vedic texts in E
 - Standard, Deep, and Really deep research modes. There is no fixed step limit: the agent keeps researching until its sub-questions are covered (runaway ceilings only, see `RESEARCH_MAX_STEPS` / `RESEARCH_MAX_MINUTES`).
 - One-click PDF download of any report (Devanagari, Gujarati, tables and diagrams included), rendered server-side with Chromium.
 - English and Gujarati report-language selection.
-- Anthropic model integration through the Vercel AI SDK. API keys remain on the server.
+- Mistral model integration (default `mistral-small-latest`, chosen for low cost) through the Vercel AI SDK. API keys remain on the server.
 - Playwright search and article extraction, restricted to HTTPS URLs on `vedic.study` and its subdomains.
 - Optional Playwright storage state for a site account you are authorized to use.
 - Devanagari and Gujarati script normalization with original text preserved beside a Latin transliteration.
@@ -19,7 +19,7 @@ A private, source-grounded research workspace for investigating Vedic texts in E
 ## Requirements
 
 - Node.js 20 or newer.
-- An Anthropic API key.
+- A Mistral API key.
 - An app password and a random session-signing secret.
 - Chromium for Playwright. Install it with the command below.
 - An authorized `vedic.study` account only if the pages you need are gated.
@@ -35,7 +35,7 @@ cp .env.example .env.local
 Set these values in `.env.local`:
 
 ```dotenv
-ANTHROPIC_API_KEY=your-server-side-key
+MISTRAL_API_KEY=your-server-side-key
 APP_ACCESS_PASSWORD=choose-a-long-private-password
 SESSION_SECRET=generate-a-random-secret-at-least-32-characters-long
 ```
@@ -80,8 +80,8 @@ npm run build
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `ANTHROPIC_API_KEY` | Yes for research | Server-side model API key |
-| `ANTHROPIC_MODEL` | No | Model name; defaults to `claude-sonnet-5-5` |
+| `MISTRAL_API_KEY` | Yes for research | Server-side model API key |
+| `MISTRAL_MODEL` | No | Model name; defaults to `mistral-small-latest` (low cost, 262k context) |
 | `APP_ACCESS_PASSWORD` | Yes | Shared sign-in password for this private instance |
 | `SESSION_SECRET` | Yes | Random secret of at least 32 characters for signed sessions |
 | `VEDIC_STUDY_EMAIL` / `VEDIC_STUDY_PASSWORD` | No | Invited account used for automatic sign-in |
@@ -96,7 +96,9 @@ The app is designed as a single private instance with one shared password, not a
 
 The site is invite-only: unauthenticated requests are redirected to a "Not Yet Open" sign-in gate, and the bare `vedic.study` domain does not resolve (use `www.vedic.study`). The app never tries to get around the gate; it signs in as you.
 
-**Option 1 — automatic sign-in (recommended).** Put the email and password of your invited account in the server environment:
+**Option 1 — enter it in the app (default).** After signing in with the app password, Shastra asks for your vedic.study email and password, signs in once, and keeps only the session in server memory (the password is discarded).
+
+**Option 2 — preconfigured credentials.** Put the email and password of your invited account in the server environment:
 
 ```dotenv
 VEDIC_STUDY_EMAIL=you@example.com
@@ -105,7 +107,7 @@ VEDIC_STUDY_PASSWORD=your-password
 
 The server signs in once through the site's normal email form at `/auth/login`, keeps the session in memory, and signs in again by itself if it expires. Credentials stay server-side and are never sent to the browser or the model. This does not work for accounts that only use "Continue with Google/Apple".
 
-**Option 2 — captured session.** Run `npm run capture:vedic-session`, sign in yourself in the window that opens (any method, including Google), and the saved state is used for research.
+**Option 3 — captured session.** Run `npm run capture:vedic-session`, sign in yourself in the window that opens (any method, including Google), and the saved state is used for research.
 
 The search-result selectors have not been verified against signed-in pages, so check a first search before relying on the agent.
 

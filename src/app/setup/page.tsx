@@ -17,7 +17,7 @@ export default function SetupPage() {
           for local development), then restart the app.
         </p>
         <div className="my-6 space-y-3 rounded-2xl border border-cream-300 bg-white/45 p-5 text-sm">
-          <p><code>ANTHROPIC_API_KEY</code> — server-side model access.</p>
+          <p><code>MISTRAL_API_KEY</code> — server-side model access.</p>
           <p><code>APP_ACCESS_PASSWORD</code> — the private app sign-in password.</p>
           <p><code>SESSION_SECRET</code> — a random signing secret, at least 32 characters.</p>
         </div>

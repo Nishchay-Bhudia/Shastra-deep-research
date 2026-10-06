@@ -1,4 +1,4 @@
-import { anthropic } from "@ai-sdk/anthropic";
+import { mistral } from "@ai-sdk/mistral";
 import {
   convertToModelMessages,
   stepCountIs,
@@ -18,6 +18,7 @@ import {
 } from "@/lib/research/config";
 import { compactToolResults } from "@/lib/research/context";
 import {
+  hasVedicAccess,
   isAllowedVedicUrl,
   readVedicDocument,
   searchVedicKnowledgeBase,
@@ -144,10 +145,16 @@ function getTools(notes: Note[]) {
 }
 
 export async function POST(request: NextRequest) {
-  if (!process.env.ANTHROPIC_API_KEY) {
+  if (!process.env.MISTRAL_API_KEY) {
     return NextResponse.json(
-      { error: "Set ANTHROPIC_API_KEY in the server environment to run research." },
+      { error: "Set MISTRAL_API_KEY in the server environment to run research." },
       { status: 503 },
+    );
+  }
+  if (!hasVedicAccess()) {
+    return NextResponse.json(
+      { error: "Connect your vedic.study account first.", code: "vedic_not_connected" },
+      { status: 409 },
     );
   }
 
@@ -172,11 +179,11 @@ export async function POST(request: NextRequest) {
   const startedAt = Date.now();
   const notes: Note[] = [];
   const baseSystem = buildSystemPrompt(parsed.data.language, depth);
-  const modelName = process.env.ANTHROPIC_MODEL || DEFAULT_MODEL;
+  const modelName = process.env.MISTRAL_MODEL || DEFAULT_MODEL;
 
   try {
     const result = streamText({
-      model: anthropic(modelName),
+      model: mistral(modelName),
       system: baseSystem,
       messages: await convertToModelMessages(stripOldToolParts(messages)),
       tools: getTools(notes),

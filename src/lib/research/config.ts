@@ -1,7 +1,8 @@
 export type Depth = "standard" | "deep" | "really-deep";
 export type Language = "English" | "Gujarati";
 
-export const DEFAULT_MODEL = "claude-sonnet-5-5";
+// Low-cost model with reliable tool calling and a 262k-token context.
+export const DEFAULT_MODEL = "mistral-small-latest";
 
 /**
  * Research is not capped at a fixed number of steps: the agent keeps going

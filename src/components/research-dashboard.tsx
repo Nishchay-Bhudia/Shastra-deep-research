@@ -2,9 +2,10 @@
 
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { GlassPanel } from "@/components/glass-panel";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
+import { VedicConnectPanel } from "@/components/vedic-connect-panel";
 
 type Depth = "standard" | "deep" | "really-deep";
 type Language = "English" | "Gujarati";
@@ -89,6 +90,14 @@ export function ResearchDashboard() {
   const [depth, setDepth] = useState<Depth>("deep");
   const [language, setLanguage] = useState<Language>("English");
   const [authError, setAuthError] = useState("");
+  const [connected, setConnected] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    fetch("/api/vedic")
+      .then((response) => response.json())
+      .then((data: { connected?: boolean }) => setConnected(Boolean(data.connected)))
+      .catch(() => setConnected(false));
+  }, []);
   const transport = useMemo(
     () => new DefaultChatTransport({ api: "/api/research" }),
     [],
@@ -134,10 +143,19 @@ export function ResearchDashboard() {
     }
   }
 
+  async function disconnectVedic() {
+    await fetch("/api/vedic", { method: "DELETE" });
+    setConnected(false);
+  }
+
   async function signOut() {
+    await fetch("/api/vedic", { method: "DELETE" }).catch(() => undefined);
     await fetch("/api/auth/logout", { method: "POST" });
     window.location.assign("/login");
   }
+
+  if (connected === null) return <main className="min-h-screen" aria-busy="true" />;
+  if (!connected) return <VedicConnectPanel onConnected={() => setConnected(true)} />;
 
   return (
     <main className="min-h-screen px-4 py-5 sm:px-8 sm:py-8">
@@ -159,6 +177,13 @@ export function ResearchDashboard() {
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-700" />
               Source-bound to vedic.study
             </span>
+            <button
+              type="button"
+              onClick={disconnectVedic}
+              className="rounded-full px-3 py-2 text-xs text-cream-700 transition hover:bg-white/60"
+            >
+              Switch vedic.study account
+            </button>
             <button
               type="button"
               onClick={signOut}

@@ -140,14 +140,54 @@ function hasLoginCredentials() {
   return Boolean(process.env.VEDIC_STUDY_EMAIL && process.env.VEDIC_STUDY_PASSWORD);
 }
 
+// Held on globalThis so every route bundle in this server process shares it.
+const CONNECTION_TTL_MS = 12 * 60 * 60_000;
+type Connection = { state: StorageState; expires: number };
+const globalStore = globalThis as unknown as { __vedicConnection?: Connection };
+
+function getConnection(): Connection | undefined {
+  const connection = globalStore.__vedicConnection;
+  if (connection && connection.expires <= Date.now()) {
+    globalStore.__vedicConnection = undefined;
+    return undefined;
+  }
+  return connection;
+}
+
+/** True when a signed-in session, configured credentials, or a state file is available. */
+export function hasVedicAccess(): boolean {
+  return Boolean(
+    getConnection() ||
+      hasLoginCredentials() ||
+      process.env.VEDIC_STUDY_STORAGE_STATE_PATH,
+  );
+}
+
+export function isVedicConnected(): boolean {
+  return hasVedicAccess();
+}
+
+export function disconnectVedic() {
+  globalStore.__vedicConnection = undefined;
+  loginPromise = undefined;
+  cache.clear();
+}
+
 /**
- * Signs in once with the account in VEDIC_STUDY_EMAIL / VEDIC_STUDY_PASSWORD
- * through the site's normal email form, then reuses the resulting browser state
- * (cookies, local storage, IndexedDB) for every research page.
+ * Signs in with credentials typed into the app. Only the resulting browser
+ * state is kept (in memory); the password is discarded.
  */
-async function signIn(): Promise<StorageState> {
-  const email = process.env.VEDIC_STUDY_EMAIL!;
-  const password = process.env.VEDIC_STUDY_PASSWORD!;
+export async function connectVedic(email: string, password: string) {
+  const state = await signIn(email, password);
+  globalStore.__vedicConnection = { state, expires: Date.now() + CONNECTION_TTL_MS };
+  cache.clear();
+}
+
+/**
+ * Signs in through the site's normal email form and returns the browser state
+ * (cookies, local storage, IndexedDB) to reuse for research pages.
+ */
+async function signIn(email: string, password: string): Promise<StorageState> {
   const browser = await getBrowser();
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   try {
@@ -171,10 +211,19 @@ async function signIn(): Promise<StorageState> {
       throw new Error(
         `Signing in to vedic.study did not complete. ${
           message ? `The site said: "${message.trim().slice(0, 200)}". ` : ""
-        }Check VEDIC_STUDY_EMAIL and VEDIC_STUDY_PASSWORD. Accounts that only use "Continue with Google/Apple" have no password; use the manual session capture instead.`,
+        }Check the email and password. Accounts that only use "Continue with Google/Apple" have no password; use the manual session capture instead.`,
       );
     }
     await page.waitForLoadState("networkidle", { timeout: SETTLE_TIMEOUT_MS }).catch(() => undefined);
+
+    // A valid sign-in can still be an account that is not on the invite list.
+    await page.goto("https://www.vedic.study/", { waitUntil: "domcontentloaded" });
+    await page.waitForLoadState("networkidle", { timeout: SETTLE_TIMEOUT_MS }).catch(() => undefined);
+    if (isGatePath(new URL(page.url()).pathname)) {
+      throw new Error(
+        "You signed in, but vedic.study still shows its invite-only gate for this account. Use the email address that was invited.",
+      );
+    }
     return await context.storageState({ indexedDB: true });
   } finally {
     await context.close();
@@ -183,7 +232,10 @@ async function signIn(): Promise<StorageState> {
 
 function getLoginState(): Promise<StorageState> {
   if (!loginPromise) {
-    loginPromise = signIn().catch((error: unknown) => {
+    loginPromise = signIn(
+      process.env.VEDIC_STUDY_EMAIL!,
+      process.env.VEDIC_STUDY_PASSWORD!,
+    ).catch((error: unknown) => {
       loginPromise = undefined;
       throw error;
     });
@@ -201,7 +253,10 @@ async function getContext(): Promise<BrowserContext> {
   };
 
   const statePath = process.env.VEDIC_STUDY_STORAGE_STATE_PATH;
-  if (hasLoginCredentials()) {
+  const connection = getConnection();
+  if (connection) {
+    contextOptions.storageState = connection.state;
+  } else if (hasLoginCredentials()) {
     contextOptions.storageState = await getLoginState();
   } else if (statePath) {
     const resolvedPath = path.resolve(process.cwd(), statePath);
@@ -288,7 +343,7 @@ async function openAllowedPage(context: BrowserContext, url: string) {
   if (isGatePath(new URL(page.url()).pathname)) {
     await page.close();
     throw new GateError(
-      "vedic.study is invite-only and redirected to its sign-in gate. Set VEDIC_STUDY_EMAIL and VEDIC_STUDY_PASSWORD for an invited account (or capture a session with `npm run capture:vedic-session`); this app will not bypass the gate.",
+      "vedic.study is invite-only and redirected to its sign-in gate. Reconnect your invited vedic.study account in the app (or capture a session with `npm run capture:vedic-session`); this app will not bypass the gate.",
     );
   }
 
