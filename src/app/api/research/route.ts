@@ -10,12 +10,21 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { normalizeScrapedText } from "@/lib/nlp/transliterate";
 import {
+  buildSystemPrompt,
+  DEFAULT_MODEL,
+  getStepCeiling,
+  getStepGuidance,
+  getTimeBudgetMs,
+} from "@/lib/research/config";
+import { compactToolResults } from "@/lib/research/context";
+import {
+  isAllowedVedicUrl,
   readVedicDocument,
   searchVedicKnowledgeBase,
 } from "@/lib/scraper/browser";
 
 export const runtime = "nodejs";
-export const maxDuration = 300;
+export const maxDuration = 800;
 
 const requestSchema = z.object({
   messages: z.array(z.unknown()).min(1).max(30),
@@ -24,34 +33,41 @@ const requestSchema = z.object({
 });
 
 const MAX_QUERY_LENGTH = 2_000;
-const MAX_DOCUMENT_LENGTH = 22_000;
+const DOCUMENT_CHUNK_LENGTH = 22_000;
+const MAX_NOTES = 300;
+const MAX_LEDGER_CHARS = 60_000;
 
-function getMaxSteps(depth: "standard" | "deep" | "really-deep") {
-  if (depth === "deep") return 15;
-  if (depth === "really-deep") return 30;
-  return 5;
+type Note = { url: string; title: string; note: string; quote?: string };
+
+/**
+ * Earlier turns keep their text (and its citations) but drop raw tool output,
+ * which would otherwise re-send tens of thousands of tokens on every follow-up.
+ */
+function stripOldToolParts(messages: UIMessage[]): UIMessage[] {
+  const lastIndex = messages.length - 1;
+  return messages.map((message, index) =>
+    index === lastIndex
+      ? message
+      : { ...message, parts: message.parts.filter((part) => !part.type.startsWith("tool-")) },
+  );
 }
 
-function buildSystemPrompt(language: "English" | "Gujarati") {
-  return `You are Shastra, a careful Vedic research assistant. Write the final research response in ${language}.
-
-SOURCE BOUNDARY
-- Treat retrieved material from vedic.study as the only evidence for factual claims about the texts.
-- Never fill gaps from prior knowledge. If the site did not provide evidence, say so plainly.
-- Search the knowledge base before making substantive claims. Read source pages before relying on them.
-- Cite each substantive factual claim with a Markdown link using the exact title and URL returned by a tool. Never invent a citation, URL, quotation, verse, translation, or attribution.
-- Use direct Sanskrit or Gujarati quotations only when the exact text was retrieved. Preserve the original script and clearly distinguish a source translation from your own explanation.
-- Tell the reader when the available pages do not establish a conclusion or when interpretations conflict.
-
-RESEARCH METHOD
-- Begin with broad searches that cover the user's question and its key terms; use additional targeted searches to close important gaps.
-- For comparative questions, search each named text or tradition and report differences without flattening them into one view.
-- Structure substantial reports with an executive summary, source-grounded analysis, limitations, and a short source list.
-- For complex conceptual relationships, include a Mermaid diagram in a fenced \`mermaid\` block. Label it as a synthesis of the cited sources, not as a quotation.
-- Keep source excerpts and tool results private from the report unless quoting or summarizing them with citations.`;
+function formatLedger(notes: Note[]): string {
+  if (notes.length === 0) return "";
+  const text = notes
+    .map(
+      (entry, index) =>
+        `${index + 1}. [${entry.title}](${entry.url}) — ${entry.note}${
+          entry.quote ? ` Quote: "${entry.quote}"` : ""
+        }\n`,
+    )
+    .join("");
+  // Keep the most recent notes if the ledger outgrows its budget.
+  const trimmed = text.length > MAX_LEDGER_CHARS ? text.slice(-MAX_LEDGER_CHARS) : text;
+  return `\n\nRESEARCH NOTES SAVED SO FAR (your evidence; cite these URLs):\n${trimmed}`;
 }
 
-function getTools() {
+function getTools(notes: Note[]) {
   return {
     search_knowledge_base: tool({
       description:
@@ -80,22 +96,48 @@ function getTools() {
     }),
     read_document: tool({
       description:
-        "Read a full source page found through search_knowledge_base. The URL must be an exact vedic.study URL returned by search.",
+        "Read a source page found through search_knowledge_base or a link returned by a previous read_document. The URL must be an exact vedic.study URL. Long pages are returned in sections: use offset to continue where nextOffset left off. Also returns same-site links to follow.",
       inputSchema: z.object({
         url: z.string().url(),
+        offset: z.number().int().min(0).default(0),
       }),
-      execute: async ({ url }) => {
+      execute: async ({ url, offset }) => {
         try {
           const document = await readVedicDocument(url);
+          const normalized = normalizeScrapedText(document.content);
+          const end = offset + DOCUMENT_CHUNK_LENGTH;
           return {
             title: document.title,
             url: document.url,
-            content: normalizeScrapedText(document.content).slice(0, MAX_DOCUMENT_LENGTH),
-            truncated: document.content.length > MAX_DOCUMENT_LENGTH,
+            content: normalized.slice(offset, end),
+            offset,
+            totalLength: normalized.length,
+            nextOffset: end < normalized.length ? end : null,
+            links: document.links,
           };
         } catch (error) {
           return { error: error instanceof Error ? error.message : "Could not read the page." };
         }
+      },
+    }),
+    save_note: tool({
+      description:
+        "Save a finding to your research notes. Notes persist for the whole run while older tool results are compacted. Record the page URL and title exactly as returned by a tool, a precise note, and the exact quotation when relevant.",
+      inputSchema: z.object({
+        url: z.string().url(),
+        title: z.string().min(1).max(300),
+        note: z.string().min(1).max(1_500),
+        quote: z.string().max(1_500).optional(),
+      }),
+      execute: async (entry) => {
+        if (!isAllowedVedicUrl(entry.url)) {
+          return { error: "Notes must cite a vedic.study page you retrieved." };
+        }
+        if (notes.length >= MAX_NOTES) {
+          return { error: "The notes are full. Write the report from what is saved." };
+        }
+        notes.push(entry);
+        return { saved: true, totalNotes: notes.length };
       },
     }),
   };
@@ -125,40 +167,35 @@ export async function POST(request: NextRequest) {
   }
 
   const messages = parsed.data.messages as UIMessage[];
-  const maxSteps = getMaxSteps(parsed.data.depth);
-  const baseSystem = buildSystemPrompt(parsed.data.language);
-  const modelName = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514";
+  const depth = parsed.data.depth;
+  const ceiling = getStepCeiling(depth);
+  const startedAt = Date.now();
+  const notes: Note[] = [];
+  const baseSystem = buildSystemPrompt(parsed.data.language, depth);
+  const modelName = process.env.ANTHROPIC_MODEL || DEFAULT_MODEL;
 
   try {
     const result = streamText({
       model: anthropic(modelName),
       system: baseSystem,
-      messages: await convertToModelMessages(messages),
-      tools: getTools(),
-      stopWhen: stepCountIs(maxSteps),
-      maxOutputTokens: 12_000,
-      prepareStep: ({ stepNumber }) => {
-        const completedSteps = stepNumber + 1;
-        let checkpoint = "";
-
-        if (parsed.data.depth === "deep" && completedSteps === 5) {
-          checkpoint =
-            "The initial search phase is complete. Search specifically for alternative interpretations, commentary, or textual context before synthesizing.";
-        } else if (parsed.data.depth === "really-deep" && completedSteps === 10) {
-          checkpoint =
-            "Move beyond broad coverage: look for textual chronology, commentary, and differing interpretations in additional sources.";
-        } else if (parsed.data.depth === "really-deep" && completedSteps === 20) {
-          checkpoint =
-            "Check whether the evidence covers each important part of the question. Search for counterexamples or conflicting accounts before drawing conclusions.";
-        } else if (
-          parsed.data.depth === "really-deep" &&
-          completedSteps === 27
-        ) {
-          checkpoint =
-            "Stop expanding the search and synthesize the retrieved evidence now. Cite every substantive factual claim and state remaining gaps.";
-        }
-
-        return checkpoint ? { system: `${baseSystem}\n\n${checkpoint}` } : undefined;
+      messages: await convertToModelMessages(stripOldToolParts(messages)),
+      tools: getTools(notes),
+      stopWhen: stepCountIs(ceiling),
+      maxOutputTokens: 16_000,
+      abortSignal: request.signal,
+      prepareStep: ({ stepNumber, messages: stepMessages }) => {
+        const { note, finalize } = getStepGuidance(
+          depth,
+          stepNumber,
+          Date.now() - startedAt,
+          ceiling,
+          getTimeBudgetMs(),
+        );
+        return {
+          system: `${baseSystem}${formatLedger(notes)}${note ? `\n\n${note}` : ""}`,
+          messages: compactToolResults(stepMessages),
+          ...(finalize ? { activeTools: [] } : {}),
+        };
       },
     });
 

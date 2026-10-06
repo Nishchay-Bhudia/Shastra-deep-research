@@ -5,7 +5,8 @@ A private, source-grounded research workspace for investigating Vedic texts in E
 ## What is included
 
 - Next.js App Router app with a responsive cream-and-glass research dashboard.
-- Standard, Deep, and Really deep research modes (5 / 15 / 30 maximum model steps).
+- Standard, Deep, and Really deep research modes. There is no fixed step limit: the agent keeps researching until its sub-questions are covered (runaway ceilings only, see `RESEARCH_MAX_STEPS` / `RESEARCH_MAX_MINUTES`).
+- One-click PDF download of any report (Devanagari, Gujarati, tables and diagrams included), rendered server-side with Chromium.
 - English and Gujarati report-language selection.
 - Anthropic model integration through the Vercel AI SDK. API keys remain on the server.
 - Playwright search and article extraction, restricted to HTTPS URLs on `vedic.study` and its subdomains.
@@ -83,6 +84,8 @@ npm run build
 | `ANTHROPIC_MODEL` | No | Model name; defaults to `claude-sonnet-5-5` |
 | `APP_ACCESS_PASSWORD` | Yes | Shared sign-in password for this private instance |
 | `SESSION_SECRET` | Yes | Random secret of at least 32 characters for signed sessions |
+| `VEDIC_STUDY_EMAIL` / `VEDIC_STUDY_PASSWORD` | No | Invited account used for automatic sign-in |
+| `RESEARCH_MAX_STEPS` / `RESEARCH_MAX_MINUTES` | No | Runaway ceilings (defaults: 40/150/500 steps by depth, 60 minutes) |
 | `VEDIC_STUDY_STORAGE_STATE_PATH` | No | Server-side path to an authorized Playwright storage-state file |
 | `VEDIC_STUDY_SESSION_STORAGE_JSON` | No | Server-side JSON object for session storage values, if the site needs them |
 | `VEDIC_SEARCH_URL_TEMPLATE` | No | HTTPS search page template; `{query}` is URL-encoded |
@@ -91,12 +94,26 @@ The app is designed as a single private instance with one shared password, not a
 
 ## Access to vedic.study
 
-As of October 2026 the site is invite-only: unauthenticated requests are redirected to a "Not Yet Open" sign-in gate, and the bare `vedic.study` domain does not resolve (use `www.vedic.study`). The app detects the gate and reports it rather than trying to get around it. You need an invited account: run `npm run capture:vedic-session`, sign in yourself, and the saved state (including IndexedDB, where the site keeps its sign-in) is used for research. The search selectors have not been verified against signed-in pages, so check a first search result before relying on the agent.
+The site is invite-only: unauthenticated requests are redirected to a "Not Yet Open" sign-in gate, and the bare `vedic.study` domain does not resolve (use `www.vedic.study`). The app never tries to get around the gate; it signs in as you.
+
+**Option 1 — automatic sign-in (recommended).** Put the email and password of your invited account in the server environment:
+
+```dotenv
+VEDIC_STUDY_EMAIL=you@example.com
+VEDIC_STUDY_PASSWORD=your-password
+```
+
+The server signs in once through the site's normal email form at `/auth/login`, keeps the session in memory, and signs in again by itself if it expires. Credentials stay server-side and are never sent to the browser or the model. This does not work for accounts that only use "Continue with Google/Apple".
+
+**Option 2 — captured session.** Run `npm run capture:vedic-session`, sign in yourself in the window that opens (any method, including Google), and the saved state is used for research.
+
+The search-result selectors have not been verified against signed-in pages, so check a first search before relying on the agent.
 
 ## How the agent works
 
 - Parallel searches and full-page reads, with long pages paged through an `offset`, and same-site links returned from each page so the agent can follow commentary and parallel passages.
-- The last allowed step always has tools disabled, so a run always ends in a written report; earlier steps get phase guidance (explore, deepen, close gaps).
+- A `save_note` tool keeps findings and quotations across the whole run while older page text is compacted, which is what lets very deep runs continue without exhausting the model's context.
+- When the safety ceiling or time budget is reached, tools are switched off for one last step so a run always ends in a written report.
 - Citations are checked in the UI: links that no tool returned are tagged "unverified".
 - Search and page results are cached for ten minutes and browser use is limited to three concurrent pages.
 

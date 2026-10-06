@@ -10,9 +10,9 @@ type Depth = "standard" | "deep" | "really-deep";
 type Language = "English" | "Gujarati";
 
 const depthOptions: { value: Depth; label: string; detail: string }[] = [
-  { value: "standard", label: "Standard", detail: "Quick overview · up to 5 steps" },
-  { value: "deep", label: "Deep", detail: "Cross-reference · up to 15 steps" },
-  { value: "really-deep", label: "Really deep", detail: "Exhaustive inquiry · up to 30 steps" },
+  { value: "standard", label: "Standard", detail: "Quick, focused answer" },
+  { value: "deep", label: "Deep", detail: "Cross-references sources" },
+  { value: "really-deep", label: "Really deep", detail: "No step limit · goes as deep as needed" },
 ];
 
 function messageText(message: { parts?: Array<{ type: string; text?: string }> }) {
@@ -63,7 +63,9 @@ function toolStatus(message: {
           ? "Searching vedic.study"
           : part.type === "tool-read_document"
             ? "Reading a source"
-            : "Researching";
+            : part.type === "tool-save_note"
+              ? "Taking notes"
+              : "Researching";
       const done = part.state === "output-available" || part.state === "output-error";
       return (
         <div
@@ -106,6 +108,29 @@ export function ResearchDashboard() {
       setAuthError(
         sendError instanceof Error ? sendError.message : "The request could not be sent.",
       );
+    }
+  }
+
+  async function downloadPdf(markdown: string, question: string) {
+    setAuthError("");
+    try {
+      const response = await fetch("/api/export/pdf", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ markdown, title: question.slice(0, 160) || "Research report" }),
+      });
+      if (!response.ok) {
+        const data = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(data.error || "Could not create the PDF.");
+      }
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "shastra-report.pdf";
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (pdfError) {
+      setAuthError(pdfError instanceof Error ? pdfError.message : "Could not create the PDF.");
     }
   }
 
@@ -233,7 +258,7 @@ export function ResearchDashboard() {
                 </div>
               </div>
             ) : (
-              messages.map((message) => {
+              messages.map((message, messageIndex) => {
                 const text = messageText(message);
                 const statuses = toolStatus(message);
                 const sources = retrievedSources(message as { parts?: ToolPart[] });
@@ -266,6 +291,20 @@ export function ResearchDashboard() {
                       <MarkdownRenderer content={text} verifiedUrls={new Set(sources.keys())} />
                     ) : (
                       <span className="sr-only">Research in progress</span>
+                    )}
+                    {text && !(isBusy && messageIndex === messages.length - 1) && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const question = [...messages.slice(0, messageIndex)]
+                            .reverse()
+                            .find((m) => m.role === "user");
+                          void downloadPdf(text, question ? messageText(question) : "");
+                        }}
+                        className="mt-4 rounded-full border border-cream-400/75 bg-white/50 px-4 py-2 text-xs text-cream-700 transition hover:bg-white/85"
+                      >
+                        Download PDF
+                      </button>
                     )}
                     {text && readCount > 0 && (
                       <details className="mt-4 rounded-2xl border border-cream-300 bg-white/40 px-4 py-3 text-xs text-cream-700">

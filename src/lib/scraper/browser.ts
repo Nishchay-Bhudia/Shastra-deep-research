@@ -56,6 +56,18 @@ class Semaphore {
 
 const pageLimiter = new Semaphore(MAX_CONCURRENT_PAGES);
 
+async function withFreshSignIn<T>(task: () => Promise<T>): Promise<T> {
+  try {
+    return await task();
+  } catch (error) {
+    if (error instanceof GateError && hasLoginCredentials()) {
+      loginPromise = undefined; // session expired or was never accepted: sign in again once
+      return task();
+    }
+    throw error;
+  }
+}
+
 const cache = new Map<string, { expires: number; value: unknown }>();
 
 async function cached<T>(key: string, load: () => Promise<T>): Promise<T> {
@@ -114,6 +126,71 @@ async function getBrowser() {
   return browserPromise;
 }
 
+type StorageState = Awaited<ReturnType<BrowserContext["storageState"]>>;
+
+const LOGIN_URL = "https://www.vedic.study/auth/login";
+const LOGIN_TIMEOUT_MS = 30_000;
+
+/** Raised when the site sends us to its invite gate; a fresh sign-in may fix it. */
+class GateError extends Error {}
+
+let loginPromise: Promise<StorageState> | undefined;
+
+function hasLoginCredentials() {
+  return Boolean(process.env.VEDIC_STUDY_EMAIL && process.env.VEDIC_STUDY_PASSWORD);
+}
+
+/**
+ * Signs in once with the account in VEDIC_STUDY_EMAIL / VEDIC_STUDY_PASSWORD
+ * through the site's normal email form, then reuses the resulting browser state
+ * (cookies, local storage, IndexedDB) for every research page.
+ */
+async function signIn(): Promise<StorageState> {
+  const email = process.env.VEDIC_STUDY_EMAIL!;
+  const password = process.env.VEDIC_STUDY_PASSWORD!;
+  const browser = await getBrowser();
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  try {
+    const page = await context.newPage();
+    page.setDefaultTimeout(LOGIN_TIMEOUT_MS);
+    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
+    await page.locator("input#email").fill(email);
+    await page.locator("input#password").fill(password);
+    await page.getByRole("button", { name: /^sign in$/i }).click();
+
+    try {
+      await page.waitForURL((url) => !/^\/auth\//.test(url.pathname), {
+        timeout: LOGIN_TIMEOUT_MS,
+      });
+    } catch {
+      const message = await page
+        .locator('[role="alert"], .error, [class*="error"]')
+        .first()
+        .innerText({ timeout: 1_000 })
+        .catch(() => "");
+      throw new Error(
+        `Signing in to vedic.study did not complete. ${
+          message ? `The site said: "${message.trim().slice(0, 200)}". ` : ""
+        }Check VEDIC_STUDY_EMAIL and VEDIC_STUDY_PASSWORD. Accounts that only use "Continue with Google/Apple" have no password; use the manual session capture instead.`,
+      );
+    }
+    await page.waitForLoadState("networkidle", { timeout: SETTLE_TIMEOUT_MS }).catch(() => undefined);
+    return await context.storageState({ indexedDB: true });
+  } finally {
+    await context.close();
+  }
+}
+
+function getLoginState(): Promise<StorageState> {
+  if (!loginPromise) {
+    loginPromise = signIn().catch((error: unknown) => {
+      loginPromise = undefined;
+      throw error;
+    });
+  }
+  return loginPromise;
+}
+
 async function getContext(): Promise<BrowserContext> {
   const browser = await getBrowser();
   const contextOptions: Parameters<Browser["newContext"]>[0] = {
@@ -124,7 +201,9 @@ async function getContext(): Promise<BrowserContext> {
   };
 
   const statePath = process.env.VEDIC_STUDY_STORAGE_STATE_PATH;
-  if (statePath) {
+  if (hasLoginCredentials()) {
+    contextOptions.storageState = await getLoginState();
+  } else if (statePath) {
     const resolvedPath = path.resolve(process.cwd(), statePath);
     try {
       await access(resolvedPath);
@@ -208,8 +287,8 @@ async function openAllowedPage(context: BrowserContext, url: string) {
 
   if (isGatePath(new URL(page.url()).pathname)) {
     await page.close();
-    throw new Error(
-      "vedic.study is invite-only and redirected to its sign-in gate. Provide an authorized session with `npm run capture:vedic-session` (VEDIC_STUDY_STORAGE_STATE_PATH); this app will not bypass the gate.",
+    throw new GateError(
+      "vedic.study is invite-only and redirected to its sign-in gate. Set VEDIC_STUDY_EMAIL and VEDIC_STUDY_PASSWORD for an invited account (or capture a session with `npm run capture:vedic-session`); this app will not bypass the gate.",
     );
   }
 
@@ -226,7 +305,7 @@ async function openAllowedPage(context: BrowserContext, url: string) {
 
 export function searchVedicKnowledgeBase(query: string): Promise<SearchResult[]> {
   const key = `search:${query.trim().toLowerCase()}`;
-  return cached(key, () => pageLimiter.run(() => runSearch(query)));
+  return cached(key, () => pageLimiter.run(() => withFreshSignIn(() => runSearch(query))));
 }
 
 async function runSearch(query: string): Promise<SearchResult[]> {
@@ -304,7 +383,7 @@ export function readVedicDocument(url: string): Promise<SourceDocument> {
   if (!isAllowedVedicUrl(url)) {
     return Promise.reject(new Error("Only HTTPS vedic.study URLs can be read."));
   }
-  return cached(`doc:${url}`, () => pageLimiter.run(() => runRead(url)));
+  return cached(`doc:${url}`, () => pageLimiter.run(() => withFreshSignIn(() => runRead(url))));
 }
 
 async function runRead(url: string): Promise<SourceDocument> {

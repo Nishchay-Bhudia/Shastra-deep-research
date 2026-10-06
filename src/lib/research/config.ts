@@ -3,14 +3,36 @@ export type Language = "English" | "Gujarati";
 
 export const DEFAULT_MODEL = "claude-sonnet-5-5";
 
-export function getMaxSteps(depth: Depth): number {
-  if (depth === "deep") return 15;
-  if (depth === "really-deep") return 30;
-  return 5;
+/**
+ * Research is not capped at a fixed number of steps: the agent keeps going
+ * until its sub-questions are covered. These are only runaway safety ceilings,
+ * overridable with RESEARCH_MAX_STEPS and RESEARCH_MAX_MINUTES.
+ */
+export function getStepCeiling(depth: Depth): number {
+  const override = Number(process.env.RESEARCH_MAX_STEPS);
+  if (Number.isInteger(override) && override > 0) return override;
+  if (depth === "standard") return 40;
+  if (depth === "deep") return 150;
+  return 500;
 }
 
-export function buildSystemPrompt(language: Language): string {
-  return `You are Shastra, a careful Vedic research assistant. Write the final research report in ${language}.
+export function getTimeBudgetMs(): number {
+  const minutes = Number(process.env.RESEARCH_MAX_MINUTES);
+  return (Number.isFinite(minutes) && minutes > 0 ? minutes : 60) * 60_000;
+}
+
+const DEPTH_GUIDANCE: Record<Depth, string> = {
+  standard:
+    "Depth: Standard. Cover the question accurately and efficiently; stop once each sub-question has solid primary-source support.",
+  deep: "Depth: Deep. Cross-reference several sources per sub-question, read the key pages in full, and look for commentary and differing interpretations before stopping.",
+  "really-deep":
+    "Depth: Exhaustive. There is no step limit: keep researching until further searches stop turning up anything new for every sub-question. Follow links, read parallel passages, chase commentary, chronology, and counter-evidence, and test your own conclusions before stopping.",
+};
+
+export function buildSystemPrompt(language: Language, depth: Depth = "deep"): string {
+  return `${DEPTH_GUIDANCE[depth]}
+
+`+`You are Shastra, a careful Vedic research assistant. Write the final research report in ${language}.
 
 SOURCE BOUNDARY
 - Treat retrieved material from vedic.study as the only evidence for factual claims about the texts.
@@ -27,7 +49,9 @@ RESEARCH METHOD
 4. Read the most relevant pages in full. For long pages, request further sections with the offset parameter. Follow the "links" returned by read_document to related verses, commentaries, and chapters.
 5. Prefer primary text pages over summaries. For comparative questions, research each named text or tradition separately and keep their differences distinct.
 6. Before writing, check each sub-question for evidence. Spend remaining steps on gaps, conflicting accounts, and counter-evidence.
-7. Do not write prose between tool calls; the reader sees only your final report. Write the report once, after research is finished.
+7. Your tool results from older steps are compacted to save space, so use save_note as you go: record each important finding with its page URL, title, and the exact quotation or a precise paraphrase. Your saved notes are shown to you at every step and are your evidence for the final report.
+8. Stop researching when every sub-question is covered or further searches stop yielding new material. Then write the report.
+9. Do not write prose between tool calls; the reader sees only your final report. Write the report once, after research is finished.
 
 REPORT FORMAT
 - Open with a short executive summary, then source-grounded analysis organized by sub-question.
@@ -39,40 +63,26 @@ REPORT FORMAT
 }
 
 /**
- * Per-step steering. `stepNumber` is the zero-based index of the step about to
- * run. The final allowed step always has tools disabled so the run can never
- * end on a tool call without a written report.
+ * Per-step steering. The final step (ceiling or time budget reached) always
+ * has tools disabled so a run can never end on a tool call without a report.
  */
 export function getStepGuidance(
   depth: Depth,
   stepNumber: number,
+  elapsedMs = 0,
+  ceiling = getStepCeiling(depth),
+  budgetMs = getTimeBudgetMs(),
 ): { note?: string; finalize: boolean } {
-  const maxSteps = getMaxSteps(depth);
-  if (stepNumber >= maxSteps - 1) {
+  if (stepNumber >= ceiling - 1 || elapsedMs >= budgetMs) {
     return {
       finalize: true,
-      note: "The research budget is spent. Do not call any more tools. Write the complete final report now, citing every substantive claim with a retrieved source and stating remaining gaps.",
+      note: "The research budget is spent. Do not call any more tools. Write the complete final report now from your saved notes and the retrieved sources, citing every substantive claim and stating remaining gaps.",
     };
   }
-  if (stepNumber === maxSteps - 2) {
+  if (stepNumber >= ceiling - 3 || elapsedMs >= budgetMs * 0.9) {
     return {
       finalize: false,
-      note: "One research step remains before the report. Use it only for the single most important gap, then you will write the report.",
-    };
-  }
-  if (maxSteps < 10) return { finalize: false };
-
-  const progress = stepNumber / maxSteps;
-  if (progress >= 0.7) {
-    return {
-      finalize: false,
-      note: "Late phase: verify the weakest claims, look for counterexamples or conflicting accounts, and close remaining gaps. Begin preparing to synthesize.",
-    };
-  }
-  if (progress >= 0.35) {
-    return {
-      finalize: false,
-      note: "Middle phase: read the key sources in full, follow their links to commentary, chronology, and parallel passages, and look for differing interpretations.",
+      note: "The research budget is nearly spent. Use at most one more step on the most important gap, then write the final report.",
     };
   }
   return { finalize: false };
