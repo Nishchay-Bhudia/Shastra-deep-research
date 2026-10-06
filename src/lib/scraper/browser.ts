@@ -1,7 +1,9 @@
 import { access } from "node:fs/promises";
 import path from "node:path";
 import { normalizeVedicUrl } from "@/lib/vedic-url";
-import { chromium, type Browser, type BrowserContext, type Page, type Response } from "playwright";
+import type { Browser, BrowserContext, Page, Response } from "playwright-core";
+import { blobConfigured, readJson } from "@/lib/blob";
+import { launchChromium } from "@/lib/chromium";
 
 const TARGET_HOST = "vedic.study";
 const MAX_RESULTS = 15;
@@ -108,8 +110,7 @@ function getSearchUrl(query: string): string {
 
 async function getBrowser() {
   if (!scraperGlobals.__shastraBrowser) {
-    scraperGlobals.__shastraBrowser = chromium
-      .launch({ headless: true })
+    scraperGlobals.__shastraBrowser = launchChromium()
       .then((browser) => {
         // If Chromium dies, forget it (and the context that lived in it) so the next call relaunches.
         browser.on("disconnected", () => {
@@ -138,11 +139,31 @@ function getStatePath() {
   return path.resolve(process.cwd(), process.env.VEDIC_STUDY_STORAGE_STATE_PATH || DEFAULT_STATE_PATH);
 }
 
-/** True when the one-time `npm run login` session file exists. */
-export async function hasVedicAccess(): Promise<boolean> {
+const BLOB_SESSION_PATH = "vedic/session.json";
+
+type StorageStateInput = NonNullable<Parameters<Browser["newContext"]>[0]>["storageState"];
+
+/**
+ * The signed-in session saved by `npm run login`: a local file in development, or the private
+ * Vercel Blob `vedic/session.json` when deployed (uploaded by `npm run login:upload`).
+ */
+async function loadStorageState(): Promise<StorageStateInput | undefined> {
   try {
     await access(getStatePath());
-    return true;
+    return getStatePath();
+  } catch {
+    /* no local file; try the blob store */
+  }
+  if (blobConfigured()) {
+    return (await readJson<StorageStateInput & object>(BLOB_SESSION_PATH)) ?? undefined;
+  }
+  return undefined;
+}
+
+/** True when a saved vedic.study session is available. */
+export async function hasVedicAccess(): Promise<boolean> {
+  try {
+    return Boolean(await loadStorageState());
   } catch {
     return false;
   }
@@ -198,15 +219,13 @@ async function createContext(): Promise<BrowserContext> {
     viewport: { width: 1440, height: 900 },
   };
 
-  const statePath = getStatePath();
-  try {
-    await access(statePath);
-  } catch {
+  const storageState = await loadStorageState();
+  if (!storageState) {
     throw new Error(
-      "No saved vedic.study session was found. Run `npm run login` once to sign in; after that research runs on its own.",
+      "No saved vedic.study session was found. Run `npm run login` once to sign in (and `npm run login:upload` for the deployed app); after that research runs on its own.",
     );
   }
-  contextOptions.storageState = statePath;
+  contextOptions.storageState = storageState;
 
   const context = await browser.newContext(contextOptions);
   context.on("close", () => {

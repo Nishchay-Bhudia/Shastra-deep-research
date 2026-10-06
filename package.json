@@ -9,17 +9,21 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "login": "node scripts/login.mjs"
+    "login": "node --env-file-if-exists=.env.local scripts/login.mjs",
+    "login:upload": "node --env-file-if-exists=.env.local scripts/upload-session.mjs"
   },
   "dependencies": {
     "@ai-sdk/mistral": "^2.0.52",
     "@ai-sdk/react": "^2.0.0",
     "@indic-transliteration/sanscript": "^1.2.5",
+    "@sparticuz/chromium": "^153.0.0",
+    "@vercel/blob": "^2.8.1",
     "ai": "^5.0.0",
     "jose": "^6.0.0",
     "mermaid": "^11.4.1",
     "next": "^15.5.0",
     "playwright": "^1.55.0",
+    "playwright-core": "^1.63.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",

@@ -87,3 +87,66 @@ export function newChatId(): string {
     ? crypto.randomUUID()
     : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
+
+export type ChatMeta = { id: string; title: string; updatedAt: number };
+
+/** Where chats live: the server's Vercel Blob store when configured, otherwise this browser. */
+export interface ChatStorage {
+  kind: "server" | "browser";
+  list(): Promise<ChatMeta[]>;
+  load(id: string): Promise<UIMessage[]>;
+  save(chat: StoredChat): Promise<void>;
+  remove(id: string): Promise<void>;
+}
+
+const browserStorage: ChatStorage = {
+  kind: "browser",
+  async list() {
+    return loadChats().map(({ id, title, updatedAt }) => ({ id, title, updatedAt }));
+  },
+  async load(id) {
+    return loadChats().find((chat) => chat.id === id)?.messages ?? [];
+  },
+  async save(chat) {
+    saveChats([chat, ...loadChats().filter((existing) => existing.id !== chat.id)]);
+  },
+  async remove(id) {
+    saveChats(loadChats().filter((chat) => chat.id !== id));
+  },
+};
+
+const serverStorage: ChatStorage = {
+  kind: "server",
+  async list() {
+    const response = await fetch("/api/chats");
+    if (!response.ok) throw new Error("Could not load chats.");
+    return ((await response.json()) as { chats: ChatMeta[] }).chats;
+  },
+  async load(id) {
+    const response = await fetch(`/api/chats/${id}`);
+    if (!response.ok) return [];
+    return ((await response.json()) as { messages: UIMessage[] }).messages;
+  },
+  async save(chat) {
+    const response = await fetch(`/api/chats/${chat.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: chat.title, messages: chat.messages }),
+    });
+    if (!response.ok) throw new Error("Could not save the chat.");
+  },
+  async remove(id) {
+    await fetch(`/api/chats/${id}`, { method: "DELETE" });
+  },
+};
+
+/** Server storage when the deployment has it (HTTP 200 from /api/chats), else this browser. */
+export async function detectStorage(): Promise<ChatStorage> {
+  try {
+    const response = await fetch("/api/chats");
+    if (response.ok) return serverStorage;
+  } catch {
+    /* fall through */
+  }
+  return browserStorage;
+}

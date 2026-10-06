@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { chromium } from "playwright";
+import { launchChromium } from "@/lib/chromium";
 import rehypeSanitize from "rehype-sanitize";
 import rehypeStringify from "rehype-stringify";
 import remarkGfm from "remark-gfm";
@@ -61,7 +61,7 @@ export async function renderReportPdf(options: {
     ${options.subtitle ? `<p class="question"><strong>Question:</strong> ${escapeHtml(options.subtitle)}</p>` : ""}
     ${body}</body></html>`;
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchChromium();
   try {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: "load" });

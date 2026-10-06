@@ -198,6 +198,16 @@ state.origins = [...(state.origins ?? []).filter((o) => o.origin !== origin), { 
 await writeFile(statePath, JSON.stringify(state, null, 2), { mode: 0o600 });
 console.log(`Saved the session to ${statePath}`);
 console.log("Keep that file private; it is excluded from Git. Research now runs without signing in again.");
+if (process.env.BLOB_READ_WRITE_TOKEN) {
+  const { put } = await import("@vercel/blob");
+  await put("vedic/session.json", JSON.stringify(state), {
+    access: "private",
+    contentType: "application/json",
+    addRandomSuffix: false,
+    allowOverwrite: true,
+  });
+  console.log("Also uploaded it to the private Blob store, so the deployed app uses the new session too.");
+}
 
 await browser.close().catch(() => undefined); // detaches from Chrome
 child?.kill();

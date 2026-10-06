@@ -4,12 +4,12 @@ import type { UIMessage } from "ai";
 import { useEffect, useState } from "react";
 import { ChatSession } from "@/components/chat-session";
 import {
+  detectStorage,
   loadActiveChatId,
-  loadChats,
   newChatId,
   saveActiveChatId,
-  saveChats,
-  type StoredChat,
+  type ChatMeta,
+  type ChatStorage,
 } from "@/lib/chat-store";
 
 function titleFrom(messages: UIMessage[], fallback: string) {
@@ -21,64 +21,92 @@ function titleFrom(messages: UIMessage[], fallback: string) {
   return text ? text.slice(0, 70) : fallback;
 }
 
+type Entry = ChatMeta & { messages: UIMessage[] | null };
+
 export function ResearchDashboard() {
-  const [chats, setChats] = useState<StoredChat[] | null>(null);
+  const [storage, setStorage] = useState<ChatStorage | null>(null);
+  const [chats, setChats] = useState<Entry[] | null>(null);
   const [activeId, setActiveId] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
+  const [saveError, setSaveError] = useState("");
+
+  const blank = (): Entry => ({ id: newChatId(), title: "New chat", updatedAt: Date.now(), messages: [] });
 
   useEffect(() => {
-    const stored = loadChats();
-    const saved = loadActiveChatId();
-    if (stored.length > 0) {
-      setChats(stored);
-      setActiveId(stored.some((chat) => chat.id === saved) ? saved! : stored[0].id);
-    } else {
-      const first: StoredChat = { id: newChatId(), title: "New chat", updatedAt: Date.now(), messages: [] };
-      setChats([first]);
-      setActiveId(first.id);
-    }
+    let cancelled = false;
+    (async () => {
+      const chosen = await detectStorage();
+      const metas = await chosen.list().catch(() => [] as ChatMeta[]);
+      if (cancelled) return;
+      setStorage(chosen);
+      const saved = loadActiveChatId();
+      if (metas.length > 0) {
+        setChats(metas.map((meta) => ({ ...meta, messages: null })));
+        setActiveId(metas.some((meta) => meta.id === saved) ? saved! : metas[0].id);
+      } else {
+        const first = blank();
+        setChats([first]);
+        setActiveId(first.id);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     if (activeId) saveActiveChatId(activeId);
   }, [activeId]);
 
-  function persist(next: StoredChat[]) {
-    setChats(next);
-    saveChats(next.filter((chat) => chat.messages.length > 0));
-  }
+  // Chats from the server list arrive without messages; fetch the one being opened.
+  useEffect(() => {
+    if (!storage || !chats) return;
+    const active = chats.find((chat) => chat.id === activeId);
+    if (!active || active.messages !== null) return;
+    let cancelled = false;
+    storage.load(active.id).then((messages) => {
+      if (cancelled) return;
+      setChats((current) => current?.map((chat) => (chat.id === active.id ? { ...chat, messages } : chat)) ?? current);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [storage, chats, activeId]);
 
   function startNewChat() {
     if (!chats) return;
     // Reuse an empty chat instead of piling up blank ones.
-    const empty = chats.find((chat) => chat.messages.length === 0);
+    const empty = chats.find((chat) => chat.messages?.length === 0);
     if (empty) {
       setActiveId(empty.id);
     } else {
-      const fresh: StoredChat = { id: newChatId(), title: "New chat", updatedAt: Date.now(), messages: [] };
-      persist([fresh, ...chats]);
+      const fresh = blank();
+      setChats([fresh, ...chats]);
       setActiveId(fresh.id);
     }
     setMenuOpen(false);
   }
 
   function deleteChat(id: string) {
-    if (!chats) return;
+    if (!chats || !storage) return;
+    void storage.remove(id).catch(() => setSaveError("Could not delete that chat."));
     let next = chats.filter((chat) => chat.id !== id);
-    if (next.length === 0) next = [{ id: newChatId(), title: "New chat", updatedAt: Date.now(), messages: [] }];
-    persist(next);
+    if (next.length === 0) next = [blank()];
+    setChats(next);
     if (id === activeId) setActiveId(next[0].id);
   }
 
   function updateMessages(id: string, messages: UIMessage[]) {
-    setChats((current) => {
-      if (!current) return current;
-      const next = current.map((chat) =>
-        chat.id === id ? { ...chat, messages, title: titleFrom(messages, chat.title), updatedAt: Date.now() } : chat,
-      );
-      saveChats(next.filter((chat) => chat.messages.length > 0));
-      return next;
-    });
+    if (!storage) return;
+    const existing = chats?.find((chat) => chat.id === id);
+    const title = titleFrom(messages, existing?.title ?? "New chat");
+    const updatedAt = Date.now();
+    setChats((current) => current?.map((chat) => (chat.id === id ? { ...chat, messages, title, updatedAt } : chat)) ?? current);
+    if (messages.length > 0) {
+      setSaveError("");
+      void storage.save({ id, title, updatedAt, messages }).catch(() => setSaveError("Could not save this chat; it will be lost on reload."));
+    }
   }
 
   async function signOut() {
@@ -86,7 +114,7 @@ export function ResearchDashboard() {
     window.location.assign("/login");
   }
 
-  if (!chats) return <main className="min-h-screen" aria-busy="true" />;
+  if (!chats || !storage) return <main className="min-h-screen" aria-busy="true" />;
   const active = chats.find((chat) => chat.id === activeId) ?? chats[0];
 
   return (
@@ -170,12 +198,21 @@ export function ResearchDashboard() {
           </aside>
 
           <div className="min-w-0 flex-1">
-            <ChatSession
-              key={active.id}
-              chatId={active.id}
-              initialMessages={active.messages}
-              onMessages={(messages) => updateMessages(active.id, messages)}
-            />
+            {saveError && (
+              <p role="alert" className="mb-3 rounded-2xl border border-red-300/70 bg-red-50/75 px-4 py-2 text-xs text-red-900">
+                {saveError}
+              </p>
+            )}
+            {active.messages === null ? (
+              <div className="glass-surface grid min-h-[40vh] place-items-center rounded-[2rem] text-sm text-cream-700">Opening chat…</div>
+            ) : (
+              <ChatSession
+                key={active.id}
+                chatId={active.id}
+                initialMessages={active.messages}
+                onMessages={(messages) => updateMessages(active.id, messages)}
+              />
+            )}
           </div>
         </div>
         <footer className="px-2 pt-3 text-center text-[10px] leading-5 text-cream-700/80">
