@@ -397,6 +397,15 @@ export function ChatSession({
       </section>
 
       <form onSubmit={handleSubmit} className="border-t border-cream-400/55 bg-white/20 p-4 sm:px-8 sm:py-5">
+        {isBusy && (
+          <p
+            role="status"
+            className="mb-3 rounded-2xl border border-amber-400/60 bg-amber-50/80 px-4 py-2.5 text-xs leading-5 text-amber-950"
+          >
+            <strong>Please stay on this tab and keep your device awake while the research runs.</strong> If the screen turns
+            off or you switch away, the research stops.
+          </p>
+        )}
         <label className="sr-only" htmlFor="research-question">
           Research question
         </label>
