@@ -909,30 +909,36 @@ export async function POST(request: NextRequest) {
         }
 
         // Decide what happens next: finished, continue in a new request, or give up with the fallback.
-        if (state.accepted) {
-          await deleteRun(runId);
-          return;
+        // The client may have disconnected (a sleeping phone): the state is still saved so the run can be resumed.
+        try {
+          if (state.accepted) {
+            await deleteRun(runId);
+            return;
+          }
+          if (state.abandon) {
+            await deleteRun(runId);
+            deliverFallback("the report could not be written to the required standard");
+            return;
+          }
+          const overBudget = Date.now() - state.runStartedAt > getTimeBudgetMs() * 1.15;
+          const stalled = progressOf(state) === progressAtStart;
+          state.stalls = stalled ? state.stalls + 1 : 0;
+          if (state.segments >= MAX_SEGMENTS || overBudget || state.stalls >= 3) {
+            await deleteRun(runId);
+            deliverFallback(
+              state.notes.length > 0
+                ? "the run could not be completed within its limits"
+                : "the run ended before any evidence could be gathered",
+            );
+            return;
+          }
+          state.segmentOver = false;
+          await saveRun(runId, serializeState(state));
+          writer.write({ type: "data-continue", data: { runId, segment: state.segments } });
+        } catch (error) {
+          console.error("Could not finish the segment cleanly:", error);
+          await saveRun(runId, serializeState(state)).catch(() => undefined);
         }
-        if (state.abandon) {
-          await deleteRun(runId);
-          deliverFallback("the report could not be written to the required standard");
-          return;
-        }
-        const overBudget = Date.now() - state.runStartedAt > getTimeBudgetMs() * 1.15;
-        const stalled = progressOf(state) === progressAtStart;
-        state.stalls = stalled ? state.stalls + 1 : 0;
-        if (state.segments >= MAX_SEGMENTS || overBudget || state.stalls >= 3) {
-          await deleteRun(runId);
-          deliverFallback(
-            state.notes.length > 0
-              ? "the run could not be completed within its limits"
-              : "the run ended before any evidence could be gathered",
-          );
-          return;
-        }
-        state.segmentOver = false;
-        await saveRun(runId, serializeState(state));
-        writer.write({ type: "data-continue", data: { runId, segment: state.segments } });
       },
     });
 

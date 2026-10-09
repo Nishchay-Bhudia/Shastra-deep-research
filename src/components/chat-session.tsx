@@ -59,6 +59,25 @@ const isContinueMessage = (message: { role: string; parts?: { type: string; text
 
 type Turn = { user: UIMessage; assistants: UIMessage[] };
 
+/** Keeps questions, hidden continue messages, and delivered reports (as text); drops tool output and data parts. */
+function slimForRequest(messages: UIMessage[]): UIMessage[] {
+  return messages.map((message) => {
+    if (message.role === "user") return message;
+    const parts = (message.parts as { type: string; input?: { markdown?: unknown }; output?: { accepted?: boolean }; data?: { markdown?: unknown } }[])
+      .map((part) => {
+        if (part.type === "tool-submit_report" && part.output?.accepted === true && typeof part.input?.markdown === "string") {
+          return { type: "text" as const, text: part.input.markdown };
+        }
+        if (part.type === "data-report" && typeof part.data?.markdown === "string") {
+          return { type: "text" as const, text: part.data.markdown };
+        }
+        return part;
+      })
+      .filter((part) => part.type === "text");
+    return { ...message, parts } as UIMessage;
+  });
+}
+
 /** Groups messages into questions and the assistant segments that answered them (continue messages are hidden). */
 function toTurns(messages: UIMessage[]): Turn[] {
   const turns: Turn[] = [];
@@ -100,7 +119,18 @@ export function ChatSession({
   const [prefsLoaded, setPrefsLoaded] = useState(false);
   const [viewing, setViewing] = useState<{ url: string; fileName: string } | null>(null);
 
-  const transport = useMemo(() => new DefaultChatTransport({ api: "/api/research" }), []);
+  const transport = useMemo(
+    () =>
+      new DefaultChatTransport({
+        api: "/api/research",
+        // A long run piles up tool output; the server rebuilds that from its own saved state, so send only
+        // the questions and earlier reports. This also keeps the request far under Vercel's 4.5 MB limit.
+        prepareSendMessagesRequest: ({ messages, body }) => ({
+          body: { ...body, messages: slimForRequest(messages as UIMessage[]) },
+        }),
+      }),
+    [],
+  );
   const { messages, sendMessage, status, stop, error } = useChat({
     id: chatId,
     messages: initialMessages,
@@ -140,6 +170,14 @@ export function ChatSession({
       onChange({ messages: compactForStorage(messagesRef.current), pdfs: storedPdfs(current) });
     }
   }
+  useEffect(() => {
+    // While a run is in flight, save progress now and then so a reload or a dropped connection still
+    // leaves the chat (and the run id needed to resume it) behind.
+    if (!isBusy) return;
+    const timer = window.setInterval(() => persist(pdfsRef.current), 12_000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isBusy]);
   useEffect(() => {
     // Save on an error too: whatever was delivered before the connection dropped is worth keeping.
     if (status === "ready" || status === "error") persist(pdfsRef.current);
@@ -374,8 +412,7 @@ export function ChatSession({
               ? reportFor(message)
               : { analysis: analyzeMessage({ id: "pending", role: "assistant", parts: [] }), markdown: "" };
             const resumable = isLastTurn && !isBusy && !analysis.finished && Boolean(analysis.continueRunId);
-            // Between segments the run is still going (the next request starts at once), so it counts as live.
-            const live = isLastTurn && (isBusy || (resumable && !userStoppedRef.current && continuesRef.current < MAX_AUTO_CONTINUES));
+            const live = isLastTurn && isBusy;
             const hasReport = analysis.text.trim().length > 0;
             const pdf = message ? pdfs[message.id] : undefined;
             return (

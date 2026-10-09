@@ -53,6 +53,7 @@ export function analyzeMessage(message: MessageLike): Analysis {
   let reportAccepted = false;
   let qualityIssues: string[] = [];
   let continueRunId: string | undefined;
+  let runId: string | undefined;
   let fallbackMarkdown: string | undefined;
   let fallbackIssues: string[] = [];
 
@@ -67,6 +68,11 @@ export function analyzeMessage(message: MessageLike): Analysis {
 
   let lastToolIndex = -1;
   parts.forEach((part, index) => {
+    if (part.type === "data-run") {
+      const data = (part as unknown as { data?: { runId?: unknown } }).data;
+      if (data && typeof data.runId === "string") runId = data.runId;
+      return;
+    }
     if (part.type === "data-continue") {
       const data = (part as unknown as { data?: { runId?: unknown } }).data;
       if (data && typeof data.runId === "string") continueRunId = data.runId;
@@ -174,5 +180,5 @@ export function analyzeMessage(message: MessageLike): Analysis {
     (parts.some((part) => part.type === "tool-submit_report") ? "" : legacyText);
   if (!delivered && fallbackMarkdown) qualityIssues = fallbackIssues;
   const finished = reportAccepted || fallbackMarkdown !== undefined;
-  return { text, plan, sources, notes, diagrams, counts, activity, qualityIssues, finished, continueRunId: finished ? undefined : continueRunId };
+  return { text, plan, sources, notes, diagrams, counts, activity, qualityIssues, finished, continueRunId: finished ? undefined : (continueRunId ?? runId) };
 }
