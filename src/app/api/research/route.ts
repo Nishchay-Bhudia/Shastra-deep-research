@@ -36,7 +36,7 @@ export const runtime = "nodejs";
 export const maxDuration = 300;
 
 const requestSchema = z.object({
-  messages: z.array(z.unknown()).min(1).max(30),
+  messages: z.array(z.unknown()).min(1).max(400),
   depth: z.enum(["standard", "deep", "really-deep"]).default("standard"),
   language: z.enum(["English", "Gujarati"]).default("English"),
   deliverables: z
@@ -49,7 +49,27 @@ const requestSchema = z.object({
 
 /** The app sends this as a hidden message to continue a run; it is never shown or sent to the model. */
 const CONTINUE_SENTINEL = "[[continue]]";
-const MAX_SEGMENTS = 16;
+const MAX_SEGMENTS = 24;
+
+/** How long a run of each depth may take overall (RESEARCH_MAX_MINUTES is a ceiling on all of them). */
+const budgetMs = (depth: "standard" | "deep" | "really-deep") =>
+  Math.min(getTimeBudgetMs(), { standard: 15, deep: 25, "really-deep": 35 }[depth] * 60_000);
+
+/**
+ * A depth's appetite for evidence is not unlimited: past these, more searching only repeats itself and
+ * the run must move on to checking coverage and writing. (A really deep run once reached 212 notes.)
+ */
+function wrapUpReason(state: RunState, depth: "standard" | "deep" | "really-deep"): string | undefined {
+  const caps = {
+    standard: { notes: 30, reads: 28 },
+    deep: { notes: 60, reads: 60 },
+    "really-deep": { notes: 90, reads: 110 },
+  }[depth];
+  if (state.notes.length >= caps.notes) return `you have ${state.notes.length} notes`;
+  if (state.reads >= caps.reads) return `you have read ${state.reads} pages`;
+  if (Date.now() - state.runStartedAt >= budgetMs(depth) * 0.6) return "the research time is mostly used";
+  return undefined;
+}
 
 const MAX_QUERY_LENGTH = 2_000;
 const DOCUMENT_CHUNK_LENGTH = 22_000;
@@ -134,6 +154,8 @@ function getReadBudget(depth: "standard" | "deep" | "really-deep"): number {
 /** Nudges that keep a research run moving from searching to reading to noting to checking. */
 function progressNote(state: RunState, depth: "standard" | "deep" | "really-deep"): string | undefined {
   const planned = state.plan?.subQuestions.length ?? 0;
+  const wrap = wrapUpReason(state, depth);
+  if (wrap) return `Enough: ${wrap}. Stop gathering and call check_coverage now; then analyse and write.`;
   if (state.reads >= getReadBudget(depth)) {
     return "Your reading budget is used up. Save notes for what you have read and call check_coverage.";
   }
@@ -555,7 +577,7 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
         const leadTarget = depth === "standard" ? 0 : depth === "deep" ? 3 : 6;
         const leadsPending = state.readsAfterFirstCheck < leadTarget && leads.length > 0;
         // Out of time (or checked repeatedly): proceed with what exists; the report must say what is missing.
-        const outOfTime = Date.now() - state.runStartedAt >= getTimeBudgetMs() * 0.8 || state.coverageChecks >= 4;
+        const outOfTime = Date.now() - state.runStartedAt >= budgetMs(depth) * 0.8 || state.coverageChecks >= 4 || Boolean(wrapUpReason(state, depth));
         state.readyToWrite = outOfTime || (gaps.length === 0 && !thin && !leadsPending);
 
         const problems = [
@@ -681,7 +703,7 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
           relaxed: state.finalizing,
         });
         // Late in the run there is no time for another rewrite: deliver what exists, with its issues noted.
-        const late = Date.now() - state.runStartedAt > getTimeBudgetMs();
+        const late = Date.now() - state.runStartedAt > budgetMs(depth);
         const final = state.finalizing || late || state.reportAttempts >= 3;
         const wordCount = markdown.trim().split(/\s+/).filter(Boolean).length;
         if (final && wordCount < 150) {
@@ -871,7 +893,7 @@ export async function POST(request: NextRequest) {
                 stepNumber,
                 Date.now() - state.runStartedAt,
                 ceiling,
-                getTimeBudgetMs(),
+                budgetMs(depth),
               );
               const steer = [note, progressNote(state, depth)].filter(Boolean).join("\n");
               const system = `${baseSystem}${formatLedger(state)}${steer ? `\n\n${steer}` : ""}`;
@@ -898,6 +920,10 @@ export async function POST(request: NextRequest) {
                   return { system, messages: stepMessagesCompact, toolChoice: { type: "tool" as const, toolName: "create_diagram" as const } };
                 }
                 return { system, messages: stepMessagesCompact, toolChoice: { type: "tool" as const, toolName: "submit_report" as const } };
+              }
+              // Enough evidence has been gathered for this depth: go to the coverage check instead of searching on.
+              if (wrapUpReason(state, depth) && state.coverageChecks < 8) {
+                return { system, messages: stepMessagesCompact, toolChoice: { type: "tool" as const, toolName: "check_coverage" as const } };
               }
               // Still researching: the model must keep using tools until check_coverage clears it.
               return { system, messages: stepMessagesCompact, toolChoice: "required" as const };
@@ -946,7 +972,7 @@ export async function POST(request: NextRequest) {
             deliverFallback("the report could not be written to the required standard");
             return;
           }
-          const overBudget = Date.now() - state.runStartedAt > getTimeBudgetMs() * 1.15;
+          const overBudget = Date.now() - state.runStartedAt > budgetMs(depth) * 1.15;
           const stalled = progressOf(state) === progressAtStart;
           state.stalls = stalled ? state.stalls + 1 : 0;
           if (state.segments >= MAX_SEGMENTS || overBudget || state.stalls >= 3) {

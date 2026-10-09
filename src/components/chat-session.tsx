@@ -59,23 +59,35 @@ const isContinueMessage = (message: { role: string; parts?: { type: string; text
 
 type Turn = { user: UIMessage; assistants: UIMessage[] };
 
-/** Keeps questions, hidden continue messages, and delivered reports (as text); drops tool output and data parts. */
+/**
+ * What the server needs, and no more: each question, the report that answered it (as text), and, for the
+ * run in progress, one hidden continue message. A long run adds two messages per segment, so sending
+ * them all would eventually be rejected; the server rebuilds the run from its own saved state anyway.
+ */
 function slimForRequest(messages: UIMessage[]): UIMessage[] {
-  return messages.map((message) => {
-    if (message.role === "user") return message;
-    const parts = (message.parts as { type: string; input?: { markdown?: unknown }; output?: { accepted?: boolean }; data?: { markdown?: unknown } }[])
-      .map((part) => {
-        if (part.type === "tool-submit_report" && part.output?.accepted === true && typeof part.input?.markdown === "string") {
-          return { type: "text" as const, text: part.input.markdown };
-        }
-        if (part.type === "data-report" && typeof part.data?.markdown === "string") {
-          return { type: "text" as const, text: part.data.markdown };
-        }
-        return part;
-      })
-      .filter((part) => part.type === "text");
-    return { ...message, parts } as UIMessage;
+  const turns = toTurns(messages);
+  const out: UIMessage[] = [];
+  turns.forEach((turn, index) => {
+    out.push(turn.user);
+    if (index === turns.length - 1) return; // the run in progress is represented by the continue message below
+    for (const assistant of turn.assistants) {
+      const parts = (assistant.parts as { type: string; input?: { markdown?: unknown }; output?: { accepted?: boolean }; data?: { markdown?: unknown }; text?: string }[])
+        .map((part) => {
+          if (part.type === "tool-submit_report" && part.output?.accepted === true && typeof part.input?.markdown === "string") {
+            return { type: "text" as const, text: part.input.markdown };
+          }
+          if (part.type === "data-report" && typeof part.data?.markdown === "string") {
+            return { type: "text" as const, text: part.data.markdown };
+          }
+          return part;
+        })
+        .filter((part) => part.type === "text");
+      if (parts.length > 0) out.push({ ...assistant, parts } as UIMessage);
+    }
   });
+  const last = messages[messages.length - 1];
+  if (last && isContinueMessage(last as MessageLike)) out.push(last);
+  return out;
 }
 
 /** Groups messages into questions and the assistant segments that answered them (continue messages are hidden). */
