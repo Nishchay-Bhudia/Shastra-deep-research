@@ -84,7 +84,6 @@ async function cached<T>(key: string, load: () => Promise<T>): Promise<T> {
 type ScraperGlobals = {
   __shastraBrowser?: Promise<Browser>;
   __shastraContext?: Promise<BrowserContext>;
-  __shastraSessionPage?: Page;
   __shastraSearchPage?: Page;
   __shastraLastUsed?: number;
 };
@@ -130,7 +129,6 @@ async function getBrowser() {
         browser.on("disconnected", () => {
           scraperGlobals.__shastraBrowser = undefined;
           scraperGlobals.__shastraContext = undefined;
-          scraperGlobals.__shastraSessionPage = undefined;
           scraperGlobals.__shastraSearchPage = undefined;
         });
         return browser;
@@ -151,7 +149,6 @@ async function resetBrowser() {
   const pending = scraperGlobals.__shastraBrowser;
   scraperGlobals.__shastraBrowser = undefined;
   scraperGlobals.__shastraContext = undefined;
-  scraperGlobals.__shastraSessionPage = undefined;
   scraperGlobals.__shastraSearchPage = undefined;
   const browser = await Promise.race([
     pending?.catch(() => undefined),
@@ -258,61 +255,9 @@ async function resetContext() {
   await (await pending?.catch(() => undefined))?.close().catch(() => undefined);
 }
 
-/**
- * The saved session's short-lived id token is usually expired by the time it is reused. The site's
- * own script refreshes it (from the long-lived refresh token) when a page loads, so load one page
- * first and wait for the refreshed token before the real work starts in parallel.
- */
-async function warmUpSession(context: BrowserContext) {
-  const page = await context.newPage();
-  const notes: string[] = [];
-  page.on("response", (response) => {
-    const url = response.url();
-    if (/securetoken|identitytoolkit|googleapis/.test(url)) {
-      notes.push(`${new URL(url).hostname}${new URL(url).pathname.slice(0, 30)} -> ${response.status()}`);
-    }
-  });
-  page.on("requestfailed", (request) => {
-    if (/securetoken|identitytoolkit|googleapis|vedic\.study/.test(request.url())) {
-      notes.push(`FAILED ${new URL(request.url()).hostname}: ${request.failure()?.errorText}`);
-    }
-  });
-  try {
-    await page.goto("https://www.vedic.study/", { waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS });
-    for (let waited = 0; waited < 25_000; waited += 500) {
-      const token = (await context.cookies()).find((cookie) => cookie.name === "firebase-token");
-      if (token && token.expires * 1000 > Date.now() + 10 * 60_000) return;
-      await page.waitForTimeout(500);
-    }
-  } catch (error) {
-    notes.push(`warm-up error: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
-  } finally {
-    const cookies = await context.cookies().catch(() => []);
-    const databases = await page
-      .evaluate(async () => (await indexedDB.databases()).map((db) => db.name).join(","))
-      .catch(() => "unreadable");
-    warmUpDiagnostics = `url=${page.url()} cookies=${cookies.length} indexedDB=[${databases}] ${notes.slice(0, 6).join("; ")}`;
-    await page.close().catch(() => undefined);
-  }
-}
-
-let warmUpDiagnostics = "";
-
-/** A long-lived signed-in page on the site, used for same-origin fetches and to keep the token fresh. */
+/** The open, signed-in search page doubles as the page for same-origin fetches (one app load, not two). */
 async function getSessionPage(): Promise<Page> {
-  const existing = scraperGlobals.__shastraSessionPage;
-  if (existing && !existing.isClosed()) return existing;
-  const context = await getContext();
-  const page = await context.newPage();
-  scraperGlobals.__shastraSessionPage = page;
-  await page.route("**/*", (route) =>
-    ["image", "font", "media"].includes(route.request().resourceType()) ? route.abort() : route.continue(),
-  );
-  await page.goto("https://www.vedic.study/", { waitUntil: "domcontentloaded", timeout: NAVIGATION_TIMEOUT_MS });
-  await page
-    .waitForFunction(() => /firebase-token=/.test(document.cookie), undefined, { timeout: 20_000 })
-    .catch(() => undefined);
-  return page;
+  return getSearchPage();
 }
 
 async function createContext(): Promise<BrowserContext> {
@@ -336,7 +281,6 @@ async function createContext(): Promise<BrowserContext> {
   context.on("close", () => {
     if (scraperGlobals.__shastraContext) scraperGlobals.__shastraContext = undefined;
   });
-  await warmUpSession(context);
   const sessionStorageJson = process.env.VEDIC_STUDY_SESSION_STORAGE_JSON;
   if (sessionStorageJson) {
     let sessionStorage: Record<string, string>;
@@ -437,7 +381,7 @@ async function openAllowedPage(
         : "sign-in cookie expired";
     await page.close();
     throw new GateError(
-      `vedic.study sent the saved session to its invite-only sign-in gate (${tokenState}), so the session has expired or was revoked [${warmUpDiagnostics}]. Run \`npm run login\` to sign in again; this app does not bypass the gate.`,
+      `vedic.study sent the saved session to its invite-only sign-in gate (${tokenState}), so the session has expired or was revoked. Run \`npm run login\` to sign in again; this app does not bypass the gate.`,
     );
   }
 
@@ -527,15 +471,30 @@ function searchSerially(query: string): Promise<SearchResult[]> {
  * Starts the browser and signed-in session in the background. Called as soon as a research request
  * arrives, so the cold start overlaps with the model drafting its plan instead of following it.
  */
+export type WarmReport = { ok: boolean; browserMs?: number; sessionMs?: number; pageMs?: number; error?: string };
+
+export async function warmScraper(): Promise<WarmReport> {
+  const report: WarmReport = { ok: false };
+  try {
+    let t = Date.now();
+    await withDeadline(() => getBrowser(), COLD_START_DEADLINE_MS);
+    report.browserMs = Date.now() - t;
+    t = Date.now();
+    await withDeadline(() => getContext(), COLD_START_DEADLINE_MS);
+    report.sessionMs = Date.now() - t;
+    t = Date.now();
+    await withDeadline(() => getSearchPage(), COLD_START_DEADLINE_MS);
+    report.pageMs = Date.now() - t;
+    report.ok = true;
+  } catch (error) {
+    report.error = error instanceof Error ? error.message.split("\n")[0] : String(error);
+  }
+  console.info(`[research] warm-up ${JSON.stringify(report)}`);
+  return report;
+}
+
 export function prewarmScraper() {
-  void (async () => {
-    try {
-      await withDeadline(() => getContext(), COLD_START_DEADLINE_MS);
-      await withDeadline(() => getSearchPage(), COLD_START_DEADLINE_MS);
-    } catch {
-      /* the first real call reports any problem */
-    }
-  })();
+  void warmScraper();
 }
 
 export function searchVedicKnowledgeBase(query: string): Promise<SearchResult[]> {

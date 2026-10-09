@@ -8,6 +8,7 @@ const nextConfig: NextConfig = {
   // and the Mermaid bundle used to draw diagrams inside PDFs.
   outputFileTracingIncludes: {
     "/api/research": ["./node_modules/@sparticuz/chromium/bin/**/*"],
+    "/api/warm": ["./node_modules/@sparticuz/chromium/bin/**/*"],
     "/api/export/pdf": [
       "./node_modules/@sparticuz/chromium/bin/**/*",
       "./node_modules/mermaid/dist/mermaid.min.js",

@@ -31,6 +31,8 @@ export function ResearchDashboard() {
   const blank = (): Entry => ({ id: newChatId(), title: "New chat", updatedAt: Date.now(), messages: [] });
 
   useEffect(() => {
+    // Start the server's browser while the user is still typing their question (fire and forget).
+    void fetch("/api/warm").catch(() => undefined);
     let cancelled = false;
     (async () => {
       const chosen = await detectStorage();
