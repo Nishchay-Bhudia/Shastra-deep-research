@@ -13,7 +13,10 @@ const NAVIGATION_TIMEOUT_MS = 25_000;
 const SETTLE_TIMEOUT_MS = 8_000;
 const GATE_GRACE_MS = 25_000;
 // Covers a cold start (launching Chromium, restoring the session) plus the page itself.
-const SCRAPER_DEADLINE_MS = process.env.VERCEL ? 75_000 : 60_000;
+const SCRAPER_DEADLINE_MS = process.env.VERCEL ? 60_000 : 45_000;
+// Launching Chromium and restoring the session is slow on a cold serverless instance. It has its own
+// generous allowance so that a slow start is waited for, not killed and restarted from scratch.
+const COLD_START_DEADLINE_MS = 150_000;
 const MAX_CONCURRENT_PAGES = process.env.VERCEL ? 2 : 3;
 const CACHE_TTL_MS = 10 * 60_000;
 const CACHE_MAX_ENTRIES = 150;
@@ -520,12 +523,28 @@ function searchSerially(query: string): Promise<SearchResult[]> {
   return run;
 }
 
+/**
+ * Starts the browser and signed-in session in the background. Called as soon as a research request
+ * arrives, so the cold start overlaps with the model drafting its plan instead of following it.
+ */
+export function prewarmScraper() {
+  void (async () => {
+    try {
+      await withDeadline(() => getContext(), COLD_START_DEADLINE_MS);
+      await withDeadline(() => getSearchPage(), COLD_START_DEADLINE_MS);
+    } catch {
+      /* the first real call reports any problem */
+    }
+  })();
+}
+
 export function searchVedicKnowledgeBase(query: string): Promise<SearchResult[]> {
   const key = `search:${query.trim().toLowerCase()}`;
   return cached(key, () =>
     pageLimiter.run(() =>
       withGateRetry(async () => {
         await ensureBrowserAlive();
+        await withDeadline(() => getContext(), COLD_START_DEADLINE_MS);
         return withDeadline(async () => {
           try {
             const results = await searchSerially(query);
@@ -675,6 +694,7 @@ export function readVedicDocument(url: string): Promise<SourceDocument> {
     pageLimiter.run(() =>
       withGateRetry(async () => {
         await ensureBrowserAlive();
+        await withDeadline(() => getContext(), COLD_START_DEADLINE_MS);
         return withDeadline(() => runRead(normalized), SCRAPER_DEADLINE_MS);
       }),
     ),

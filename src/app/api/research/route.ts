@@ -21,6 +21,7 @@ import { buildDiagram, type BuiltDiagram } from "@/lib/research/diagram";
 import { normalizeVedicUrl, urlKey } from "@/lib/vedic-url";
 import {
   hasVedicAccess,
+  prewarmScraper,
   readVedicDocument,
   searchVedicKnowledgeBase,
 } from "@/lib/scraper/browser";
@@ -527,6 +528,7 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  prewarmScraper();
   const messages = parsed.data.messages as UIMessage[];
   const depth = parsed.data.depth;
   const ceiling = getStepCeiling(depth);
