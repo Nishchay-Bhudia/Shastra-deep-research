@@ -48,6 +48,8 @@ export function analyzeMessage(message: MessageLike): Analysis {
   let reportMarkdown: string | undefined;
   let reportAccepted = false;
   let qualityIssues: string[] = [];
+  let fallbackMarkdown: string | undefined;
+  let fallbackIssues: string[] = [];
 
   const addSource = (url: unknown, title: unknown, overwrite = false) => {
     if (typeof url !== "string") return;
@@ -60,6 +62,13 @@ export function analyzeMessage(message: MessageLike): Analysis {
 
   let lastToolIndex = -1;
   parts.forEach((part, index) => {
+    if (part.type === "data-report" && isObject((part as { data?: unknown }).data)) {
+      // Compiled by the server from the saved notes when no normal report could be delivered.
+      const data = (part as unknown as { data: Record<string, unknown> }).data;
+      if (typeof data.markdown === "string") fallbackMarkdown = data.markdown;
+      if (Array.isArray(data.issues)) fallbackIssues = data.issues.filter((i): i is string => typeof i === "string");
+      return;
+    }
     if (!part.type.startsWith("tool-")) return;
     lastToolIndex = index;
     const name = part.type.slice("tool-".length);
@@ -146,6 +155,13 @@ export function analyzeMessage(message: MessageLike): Analysis {
     .map((part) => part.text)
     .join("");
 
-  const text = reportMarkdown ?? (parts.some((part) => part.type === "tool-submit_report") ? "" : legacyText);
+  // An accepted report wins; then a server-compiled fallback; then (older chats) plain text.
+  const delivered = reportAccepted ? reportMarkdown : undefined;
+  const text =
+    delivered ??
+    fallbackMarkdown ??
+    reportMarkdown ??
+    (parts.some((part) => part.type === "tool-submit_report") ? "" : legacyText);
+  if (!delivered && fallbackMarkdown) qualityIssues = fallbackIssues;
   return { text, plan, sources, notes, diagrams, counts, activity, qualityIssues };
 }

@@ -5,6 +5,8 @@ import {
   streamText,
   tool,
   type UIMessage,
+  createUIMessageStream,
+  createUIMessageStreamResponse,
 } from "ai";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
@@ -17,6 +19,7 @@ import {
   getTimeBudgetMs,
 } from "@/lib/research/config";
 import { compactToolResults } from "@/lib/research/context";
+import { compileFallbackReport } from "@/lib/research/fallback";
 import { checkReport, minNotesFor } from "@/lib/research/quality";
 import { buildDiagram, type BuiltDiagram } from "@/lib/research/diagram";
 import { normalizeVedicUrl, urlKey } from "@/lib/vedic-url";
@@ -47,6 +50,11 @@ const MAX_LEDGER_CHARS = 60_000;
 const MAX_DIAGRAMS = 3;
 const BOOTSTRAP_SEARCHES = 6;
 
+// A Vercel function is killed at 300 s; everything below keeps a report deliverable before that.
+const lateMs = () => (process.env.VERCEL ? 200_000 : getTimeBudgetMs() * 1.2);
+const slowMs = () => (process.env.VERCEL ? 140_000 : getTimeBudgetMs());
+const watchdogMs = () => (process.env.VERCEL ? 255_000 : getTimeBudgetMs() + 180_000);
+
 type Note = { url: string; title: string; note: string; quote?: string; subQuestion?: number };
 type Plan = { reportTitle: string; subQuestions: string[]; searchTerms: string[] };
 
@@ -73,6 +81,11 @@ type RunState = {
   accepted: boolean;
   finalizing: boolean;
   qualityIssues: string[];
+  /** Problems the tools hit (shown to the reader if no report can be written). */
+  errors: string[];
+  fallbackSent: boolean;
+  /** The agent could not produce a usable report; stop and deliver the compiled fallback. */
+  abandon: boolean;
 };
 
 type Analysis = {
@@ -175,6 +188,11 @@ function formatLedger(state: RunState): string {
   return text;
 }
 
+function recordError(state: RunState, message: string) {
+  const short = message.split("\n")[0].slice(0, 240);
+  if (!state.errors.includes(short) && state.errors.length < 8) state.errors.push(short);
+}
+
 function remember(state: RunState, url: unknown) {
   if (typeof url !== "string") return;
   const key = urlKey(url);
@@ -258,6 +276,7 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
           }
         }
         const failures = settled.filter((outcome) => outcome.status === "rejected") as PromiseRejectedResult[];
+        failures.forEach((failure) => recordError(state, String(failure.reason?.message ?? failure.reason)));
         console.info(`[research] bootstrap ${terms.length} searches in ${Date.now() - started}ms, ${initialResults.length} pages, ${failures.length} failed`);
         return {
           planned: true,
@@ -301,7 +320,9 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
                 : undefined,
           };
         } catch (error) {
-          return { error: error instanceof Error ? error.message : "Search failed." };
+          const message = error instanceof Error ? error.message : "Search failed.";
+          recordError(state, message);
+          return { error: message };
         }
       },
     }),
@@ -335,7 +356,9 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
             links: document.links,
           };
         } catch (error) {
-          return { error: error instanceof Error ? error.message : "Could not read the page." };
+          const message = error instanceof Error ? error.message : "Could not read the page.";
+          recordError(state, message);
+          return { error: message };
         }
       },
     }),
@@ -544,7 +567,15 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
           subQuestionCount: state.plan?.subQuestions.length ?? 0,
           relaxed: state.finalizing,
         });
-        const final = state.finalizing || state.reportAttempts >= 4;
+        // Late in the run there is no time for another rewrite: deliver what exists, with its issues noted.
+        const late = Date.now() - state.startedAt > lateMs();
+        const final = state.finalizing || late || state.reportAttempts >= 4;
+        const wordCount = markdown.trim().split(/\s+/).filter(Boolean).length;
+        if (final && wordCount < 150) {
+          // Not a report at all: deliver the digest compiled from the notes instead of this.
+          state.abandon = true;
+          return { error: "The report was unusable, so a digest compiled from the saved notes will be delivered instead." };
+        }
         if (result.evidence.length > 0 && !final) {
           // The evidence is not good enough to write from: go back to the sources.
           state.readyToWrite = false;
@@ -657,72 +688,140 @@ export async function POST(request: NextRequest) {
     accepted: false,
     finalizing: false,
     qualityIssues: [],
+    errors: [],
+    fallbackSent: false,
+    abandon: false,
   };
   const baseSystem = buildSystemPrompt(parsed.data.language, depth, deliverables);
   const modelName = process.env.MISTRAL_MODEL || DEFAULT_MODEL;
 
   try {
-    const result = streamText({
-      model: mistral(modelName),
-      system: baseSystem,
-      messages: await convertToModelMessages(stripOldToolParts(messages)),
-      tools: getTools(state, depth),
-      stopWhen: [stepCountIs(ceiling), () => state.accepted],
-      maxOutputTokens: 16_000,
-      // Low-cost API tiers rate-limit; retry with backoff instead of failing a long run.
-      maxRetries: 6,
-      abortSignal: request.signal,
-      onStepFinish: (step) => {
-        const calls = step.toolCalls.map((call) => call.toolName).join(",") || "text";
-        console.info(
-          `[research] ${Math.round((Date.now() - startedAt) / 1000)}s step ${step.response.messages.length ? "done" : ""} tools=${calls} tokens=${step.usage.totalTokens}`,
-        );
-      },
-      prepareStep: ({ stepNumber, messages: stepMessages }) => {
-        const { note, finalize } = getStepGuidance(
-          depth,
-          stepNumber,
-          Date.now() - startedAt,
-          ceiling,
-          getTimeBudgetMs(),
-        );
-        const steer = [note, progressNote(state, depth)].filter(Boolean).join("\n");
-        const system = `${baseSystem}${formatLedger(state)}${steer ? `\n\n${steer}` : ""}`;
-        const messages = compactToolResults(stepMessages);
+    const modelMessages = await convertToModelMessages(stripOldToolParts(messages));
+    const controller = new AbortController();
+    request.signal.addEventListener("abort", () => controller.abort());
 
-        // Tools stay defined at every step (a model that emits a call to a "removed" tool crashes the
-        // run); steering is by toolChoice, and each tool guards itself against being used out of turn.
-        // Think first: the very first action is the research plan.
-        if (!state.plan && !finalize) {
-          return { system, messages, toolChoice: { type: "tool" as const, toolName: "plan_research" as const } };
+    const stream = createUIMessageStream({
+      execute: async ({ writer }) => {
+        // The safety net: if no accepted report exists when the run ends, however it ends, the reader
+        // still gets a report compiled from the saved notes (and so a PDF), never a blank screen.
+        const deliverFallback = (reason: string) => {
+          if (state.accepted || state.fallbackSent) return;
+          state.fallbackSent = true;
+          const fallback = compileFallbackReport({
+            plan: state.plan,
+            notes: state.notes,
+            analysis: state.analysis,
+            errors: state.errors,
+            reason,
+          });
+          console.info(`[research] fallback report delivered: ${reason}`);
+          writer.write({ type: "data-report", data: fallback });
+        };
+
+        // A function killed at its time limit sends nothing at all, so give up a little earlier.
+        const watchdog = setTimeout(() => {
+          deliverFallback("the run ran out of time before a full report could be written");
+          controller.abort();
+        }, watchdogMs());
+
+        try {
+          const result = streamText({
+            model: mistral(modelName),
+            system: baseSystem,
+            messages: modelMessages,
+            tools: getTools(state, depth),
+            stopWhen: [stepCountIs(ceiling), () => state.accepted || state.abandon],
+            maxOutputTokens: 16_000,
+            // Low-cost API tiers rate-limit; retry with backoff instead of failing a long run.
+            maxRetries: 6,
+            abortSignal: controller.signal,
+            onStepFinish: (step) => {
+              const calls = step.toolCalls.map((call) => call.toolName).join(",") || "text";
+              console.info(
+                `[research] ${Math.round((Date.now() - startedAt) / 1000)}s step ${step.response.messages.length ? "done" : ""} tools=${calls} tokens=${step.usage.totalTokens}`,
+              );
+            },
+            prepareStep: ({ stepNumber, messages: stepMessages }) => {
+              const { note, finalize } = getStepGuidance(
+                depth,
+                stepNumber,
+                Date.now() - startedAt,
+                ceiling,
+                getTimeBudgetMs(),
+              );
+              const steer = [note, progressNote(state, depth)].filter(Boolean).join("\n");
+              const system = `${baseSystem}${formatLedger(state)}${steer ? `\n\n${steer}` : ""}`;
+              const messages = compactToolResults(stepMessages);
+
+              // Tools stay defined at every step (a model that emits a call to a "removed" tool crashes the
+              // run); steering is by toolChoice, and each tool guards itself against being used out of turn.
+              // Think first: the very first action is the research plan.
+              if (!state.plan && !finalize) {
+                return { system, messages, toolChoice: { type: "tool" as const, toolName: "plan_research" as const } };
+              }
+              if (state.accepted) return { system, messages, toolChoice: "none" as const };
+              // Out of budget: deliver the best honest report from what exists (checked leniently).
+              if (finalize) {
+                state.finalizing = true;
+                return { system, messages, toolChoice: { type: "tool" as const, toolName: "submit_report" as const } };
+              }
+              // Coverage confirmed: analyse, optionally draw grounded diagrams, then submit the report.
+              if (state.readyToWrite) {
+                const slow = Date.now() - startedAt > slowMs(); // no time for extras: write the report now
+                if (!slow && !state.analysis && state.analysisAttempts < 3) {
+                  return { system, messages, toolChoice: { type: "tool" as const, toolName: "analyze_evidence" as const } };
+                }
+                if (!slow && deliverables.diagrams && state.diagrams.length === 0 && state.diagramAttempts < 3) {
+                  return { system, messages, toolChoice: { type: "tool" as const, toolName: "create_diagram" as const } };
+                }
+                return { system, messages, toolChoice: { type: "tool" as const, toolName: "submit_report" as const } };
+              }
+              // Still researching: the model must keep using tools until check_coverage clears it.
+              return { system, messages, toolChoice: "required" as const };
+            },
+          });
+
+          // Provider hiccups must not blank the screen: drop stream errors (they are logged and
+          // handled by the fallback below) instead of forwarding them to the client.
+          writer.merge(
+            result
+              .toUIMessageStream({
+                onError: (error) => {
+                  console.error("Research stream error:", error);
+                  return "error";
+                },
+              })
+              .pipeThrough(
+                new TransformStream({
+                  transform(chunk, streamController) {
+                    if (chunk.type === "error") {
+                      recordError(state, "The model provider reported an error.");
+                      return;
+                    }
+                    streamController.enqueue(chunk);
+                  },
+                }),
+              ),
+          );
+          await result.steps.catch(() => undefined);
+        } catch (error) {
+          console.error("Research run failed:", error);
+          recordError(state, error instanceof Error ? error.message : "The research run failed.");
+        } finally {
+          clearTimeout(watchdog);
         }
-        if (state.accepted) return { system, messages, toolChoice: "none" as const };
-        // Out of budget: deliver the best honest report from what exists (checked leniently).
-        if (finalize) {
-          state.finalizing = true;
-          return { system, messages, toolChoice: { type: "tool" as const, toolName: "submit_report" as const } };
+
+        if (!state.accepted) {
+          deliverFallback(
+            state.notes.length > 0
+              ? "the run ended before a full report could be written"
+              : "the run ended before any evidence could be gathered",
+          );
         }
-        // Coverage confirmed: analyse, optionally draw grounded diagrams, then submit the report.
-        if (state.readyToWrite) {
-          if (!state.analysis && state.analysisAttempts < 3) {
-            return { system, messages, toolChoice: { type: "tool" as const, toolName: "analyze_evidence" as const } };
-          }
-          if (deliverables.diagrams && state.diagrams.length === 0 && state.diagramAttempts < 3) {
-            return { system, messages, toolChoice: { type: "tool" as const, toolName: "create_diagram" as const } };
-          }
-          return { system, messages, toolChoice: { type: "tool" as const, toolName: "submit_report" as const } };
-        }
-        // Still researching: the model must keep using tools until check_coverage clears it.
-        return { system, messages, toolChoice: "required" as const };
       },
     });
 
-    return result.toUIMessageStreamResponse({
-      onError: (error) => {
-        console.error("Research stream error:", error);
-        return "The research stream encountered an error. Check the server logs and try again.";
-      },
-    });
+    return createUIMessageStreamResponse({ stream });
   } catch (error) {
     console.error("Unable to start research:", error);
     return NextResponse.json(

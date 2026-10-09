@@ -119,7 +119,8 @@ export function ChatSession({
     }
   }
   useEffect(() => {
-    if (status === "ready") persist(pdfsRef.current);
+    // Save on an error too: whatever was delivered before the connection dropped is worth keeping.
+    if (status === "ready" || status === "error") persist(pdfsRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
 
@@ -196,7 +197,10 @@ export function ChatSession({
   // At the end of a run, produce the PDF automatically when that deliverable is selected.
   const previousStatus = useRef(status);
   useEffect(() => {
-    const finishedRun = previousStatus.current !== "ready" && status === "ready";
+    // A run can end with an error after the report was already delivered (or a fallback compiled), so
+    // the PDF is produced whenever a finished run left a report, however it ended.
+    const wasRunning = previousStatus.current === "submitted" || previousStatus.current === "streaming";
+    const finishedRun = wasRunning && (status === "ready" || status === "error");
     previousStatus.current = status;
     if (!finishedRun || !deliverables.pdf) return;
     const index = messages.length - 1;
@@ -353,7 +357,15 @@ export function ChatSession({
                     </span>
                   </p>
                 )}
-                {hasReport ? <MarkdownRenderer content={markdown} /> : <span className="sr-only">Research in progress</span>}
+                {hasReport ? (
+                  <MarkdownRenderer content={markdown} />
+                ) : !live ? (
+                  <p role="alert" className="rounded-2xl border border-amber-400/60 bg-amber-50/80 px-4 py-3 text-sm text-amber-950">
+                    This run ended before any report was delivered (the connection may have dropped). Please ask again.
+                  </p>
+                ) : (
+                  <span className="sr-only">Research in progress</span>
+                )}
 
                 {hasReport && !live && pdf && (
                   <div className="mt-5 flex flex-wrap items-center gap-3 rounded-2xl border border-cream-300 bg-white/45 px-4 py-3 text-sm">
