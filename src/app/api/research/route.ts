@@ -1,4 +1,4 @@
-import { mistral } from "@ai-sdk/mistral";
+import { mistral } from "@/lib/mistral";
 import {
   convertToModelMessages,
   stepCountIs,

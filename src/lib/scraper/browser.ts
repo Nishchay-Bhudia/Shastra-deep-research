@@ -82,6 +82,7 @@ type ScraperGlobals = {
   __shastraBrowser?: Promise<Browser>;
   __shastraContext?: Promise<BrowserContext>;
   __shastraSessionPage?: Page;
+  __shastraSearchPage?: Page;
   __shastraLastUsed?: number;
 };
 const scraperGlobals = globalThis as unknown as ScraperGlobals;
@@ -127,6 +128,7 @@ async function getBrowser() {
           scraperGlobals.__shastraBrowser = undefined;
           scraperGlobals.__shastraContext = undefined;
           scraperGlobals.__shastraSessionPage = undefined;
+          scraperGlobals.__shastraSearchPage = undefined;
         });
         return browser;
       })
@@ -147,6 +149,7 @@ async function resetBrowser() {
   scraperGlobals.__shastraBrowser = undefined;
   scraperGlobals.__shastraContext = undefined;
   scraperGlobals.__shastraSessionPage = undefined;
+  scraperGlobals.__shastraSearchPage = undefined;
   const browser = await Promise.race([
     pending?.catch(() => undefined),
     new Promise<undefined>((resolve) => setTimeout(resolve, 3_000)),
@@ -462,15 +465,186 @@ async function withGateRetry<T>(task: () => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * Rendering the search page from scratch costs several seconds (many times that on a serverless CPU),
+ * almost all of it loading the app. So one search page stays open and later queries are loaded by
+ * the app's own router, which only needs the search request itself (about a second).
+ */
+async function getSearchPage(): Promise<Page> {
+  const existing = scraperGlobals.__shastraSearchPage;
+  if (existing && !existing.isClosed()) return existing;
+  const context = await getContext();
+  const page = await context.newPage();
+  scraperGlobals.__shastraSearchPage = page;
+  page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
+  await page.route("**/*", (route) =>
+    ["image", "font", "media"].includes(route.request().resourceType()) ? route.abort() : route.continue(),
+  );
+  await page.goto(getSearchUrl("dharma"), { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("article h3 a[href]", { timeout: 25_000 }).catch(() => undefined);
+  if (isGatePath(new URL(page.url()).pathname)) {
+    scraperGlobals.__shastraSearchPage = undefined;
+    await page.close().catch(() => undefined);
+    throw new GateError("vedic.study sent the saved session to its invite-only sign-in gate.");
+  }
+  return page;
+}
+
+async function searchViaSpa(query: string): Promise<SearchResult[]> {
+  const page = await getSearchPage();
+  // Already showing this query (it is what the page was opened with): nothing to wait for.
+  if (new URL(page.url()).searchParams.get("q") === query) return extractSearchResults(page);
+  const answered = page.waitForResponse(
+    (response) =>
+      response.url().includes("/api/literature/shodh/search") &&
+      (response.request().postData() ?? "").includes(JSON.stringify(query)),
+    { timeout: 15_000 },
+  );
+  await page.evaluate((target) => {
+    history.pushState({}, "", target);
+    window.dispatchEvent(new PopStateEvent("popstate", { state: history.state }));
+  }, `/search?q=${encodeURIComponent(query)}`);
+  const response = await answered;
+  if (!response.ok()) throw new Error(`Search request failed (${response.status()}).`);
+  // Let the app render the cards for the response it just received.
+  await page.waitForFunction(() => document.querySelectorAll("article h3 a[href]").length > 0, undefined, { timeout: 8_000 }).catch(() => undefined);
+  await page.waitForTimeout(400);
+  return extractSearchResults(page);
+}
+
+// One shared search page means one search at a time; each takes about a second once warm.
+let searchQueue: Promise<unknown> = Promise.resolve();
+function searchSerially(query: string): Promise<SearchResult[]> {
+  const run = searchQueue.then(() => searchViaSpa(query));
+  searchQueue = run.catch(() => undefined);
+  return run;
+}
+
 export function searchVedicKnowledgeBase(query: string): Promise<SearchResult[]> {
   const key = `search:${query.trim().toLowerCase()}`;
   return cached(key, () =>
     pageLimiter.run(() =>
       withGateRetry(async () => {
         await ensureBrowserAlive();
-        return withDeadline(() => runSearch(query), SCRAPER_DEADLINE_MS);
+        return withDeadline(async () => {
+          try {
+            const results = await searchSerially(query);
+            if (results.length > 0) return results;
+          } catch (error) {
+            if (error instanceof GateError) throw error;
+            // The shared search page can get stuck; fall through to a fresh page for this query.
+            const stuck = scraperGlobals.__shastraSearchPage;
+            scraperGlobals.__shastraSearchPage = undefined;
+            void stuck?.close().catch(() => undefined);
+          }
+          return runSearch(query);
+        }, SCRAPER_DEADLINE_MS);
       }),
     ),
+  );
+}
+
+/** Reads the result cards (or, failing that, the result links) off a rendered search page. */
+async function extractSearchResults(page: Page): Promise<SearchResult[]> {
+  return page.evaluate(
+    (options) => {
+      const body = document.body;
+      const clean = (text: string | null | undefined) =>
+        (text || "").replace(/\s+/g, " ").trim();
+      const isAllowed = (target: URL) =>
+        target.protocol === "https:" &&
+        (target.hostname === options.allowedHost ||
+          target.hostname.endsWith(`.${options.allowedHost}`));
+
+      // vedic.study renders each hit as <article> with a breadcrumb, an <h3><a> title,
+      // and a highlighted snippet. Prefer that structure; it gives meaningful titles.
+      const cardResults: SearchResult[] = [];
+      const cardSeen = new Set<string>();
+      for (const card of Array.from(body.querySelectorAll("article"))) {
+        const anchor = card.querySelector<HTMLAnchorElement>("h3 a[href]");
+        if (!anchor) continue;
+        let target: URL;
+        try {
+          target = new URL(anchor.href);
+        } catch {
+          continue;
+        }
+        if (!isAllowed(target) || cardSeen.has(target.href)) continue;
+        const crumbs = Array.from(
+          card.querySelectorAll('ol[aria-label="Location"] li span:not([aria-hidden])'),
+        )
+          .map((node) => clean(node.textContent))
+          .filter(Boolean);
+        const heading = clean(anchor.textContent);
+        const kind = clean(card.querySelector("div.inline-flex")?.textContent);
+        const title = [...crumbs, heading].filter(Boolean).join(" › ").slice(0, 240);
+        const snippet = clean(card.querySelector("p")?.textContent).slice(0, 900);
+        cardSeen.add(target.href);
+        cardResults.push({
+          title: kind ? `${title} (${kind})` : title,
+          url: target.href,
+          snippet: snippet || title,
+        });
+        if (cardResults.length >= options.maxResults) break;
+      }
+      if (cardResults.length > 0) return cardResults;
+
+      // Fallback for pages that do not use the card layout.
+      const links = Array.from(body.querySelectorAll<HTMLAnchorElement>("a[href]"));
+      const seen = new Set<string>();
+      const results: SearchResult[] = [];
+
+      for (const anchor of links) {
+        let target: URL;
+        try {
+          target = new URL(anchor.href);
+        } catch {
+          continue;
+        }
+        if (
+          target.protocol !== "https:" ||
+          !(target.hostname === options.allowedHost || target.hostname.endsWith(`.${options.allowedHost}`)) ||
+          target.pathname === "/" ||
+          seen.has(target.href)
+        ) {
+          continue;
+        }
+
+        const title =
+          anchor.querySelector("h1, h2, h3, h4")?.textContent?.trim() ||
+          anchor.getAttribute("aria-label")?.trim() ||
+          anchor.textContent?.trim();
+        if (!title || title.length < 3) continue;
+
+        const container =
+          anchor.closest(
+            ".search-result-item, [data-search-result], article, li",
+          ) || anchor.parentElement;
+        const snippet = (container?.textContent || title)
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 900);
+
+        seen.add(target.href);
+        results.push({
+          title: title.replace(/\s+/g, " ").slice(0, 240),
+          url: target.href,
+          snippet,
+        });
+        if (results.length >= options.maxResults) break;
+      }
+
+      // Avoid returning utility/navigation links when no result-like links were found.
+      return results
+        .filter((item) => {
+          const pathname = new URL(item.url).pathname.toLowerCase();
+          return !/\/(gate|login|logout|signup|register|search|account|profile)(\/|$)/.test(
+            pathname,
+          );
+        })
+        .slice(0, options.maxResults);
+    },
+    { allowedHost: TARGET_HOST, maxResults: MAX_RESULTS },
   );
 }
 
@@ -481,106 +655,7 @@ async function runSearch(query: string): Promise<SearchResult[]> {
       p.waitForSelector("article h3 a[href]", { timeout: SETTLE_TIMEOUT_MS }),
     );
     try {
-      return await page.evaluate(
-        (options) => {
-          const body = document.body;
-          const clean = (text: string | null | undefined) =>
-            (text || "").replace(/\s+/g, " ").trim();
-          const isAllowed = (target: URL) =>
-            target.protocol === "https:" &&
-            (target.hostname === options.allowedHost ||
-              target.hostname.endsWith(`.${options.allowedHost}`));
-
-          // vedic.study renders each hit as <article> with a breadcrumb, an <h3><a> title,
-          // and a highlighted snippet. Prefer that structure; it gives meaningful titles.
-          const cardResults: SearchResult[] = [];
-          const cardSeen = new Set<string>();
-          for (const card of Array.from(body.querySelectorAll("article"))) {
-            const anchor = card.querySelector<HTMLAnchorElement>("h3 a[href]");
-            if (!anchor) continue;
-            let target: URL;
-            try {
-              target = new URL(anchor.href);
-            } catch {
-              continue;
-            }
-            if (!isAllowed(target) || cardSeen.has(target.href)) continue;
-            const crumbs = Array.from(
-              card.querySelectorAll('ol[aria-label="Location"] li span:not([aria-hidden])'),
-            )
-              .map((node) => clean(node.textContent))
-              .filter(Boolean);
-            const heading = clean(anchor.textContent);
-            const kind = clean(card.querySelector("div.inline-flex")?.textContent);
-            const title = [...crumbs, heading].filter(Boolean).join(" › ").slice(0, 240);
-            const snippet = clean(card.querySelector("p")?.textContent).slice(0, 900);
-            cardSeen.add(target.href);
-            cardResults.push({
-              title: kind ? `${title} (${kind})` : title,
-              url: target.href,
-              snippet: snippet || title,
-            });
-            if (cardResults.length >= options.maxResults) break;
-          }
-          if (cardResults.length > 0) return cardResults;
-
-          // Fallback for pages that do not use the card layout.
-          const links = Array.from(body.querySelectorAll<HTMLAnchorElement>("a[href]"));
-          const seen = new Set<string>();
-          const results: SearchResult[] = [];
-
-          for (const anchor of links) {
-            let target: URL;
-            try {
-              target = new URL(anchor.href);
-            } catch {
-              continue;
-            }
-            if (
-              target.protocol !== "https:" ||
-              !(target.hostname === options.allowedHost || target.hostname.endsWith(`.${options.allowedHost}`)) ||
-              target.pathname === "/" ||
-              seen.has(target.href)
-            ) {
-              continue;
-            }
-
-            const title =
-              anchor.querySelector("h1, h2, h3, h4")?.textContent?.trim() ||
-              anchor.getAttribute("aria-label")?.trim() ||
-              anchor.textContent?.trim();
-            if (!title || title.length < 3) continue;
-
-            const container =
-              anchor.closest(
-                ".search-result-item, [data-search-result], article, li",
-              ) || anchor.parentElement;
-            const snippet = (container?.textContent || title)
-              .replace(/\s+/g, " ")
-              .trim()
-              .slice(0, 900);
-
-            seen.add(target.href);
-            results.push({
-              title: title.replace(/\s+/g, " ").slice(0, 240),
-              url: target.href,
-              snippet,
-            });
-            if (results.length >= options.maxResults) break;
-          }
-
-          // Avoid returning utility/navigation links when no result-like links were found.
-          return results
-            .filter((item) => {
-              const pathname = new URL(item.url).pathname.toLowerCase();
-              return !/\/(gate|login|logout|signup|register|search|account|profile)(\/|$)/.test(
-                pathname,
-              );
-            })
-            .slice(0, options.maxResults);
-        },
-        { allowedHost: TARGET_HOST, maxResults: MAX_RESULTS },
-      );
+      return await extractSearchResults(page);
     } finally {
       await page.close();
     }
