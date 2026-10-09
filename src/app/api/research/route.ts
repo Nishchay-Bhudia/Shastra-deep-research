@@ -20,6 +20,7 @@ import {
 } from "@/lib/research/config";
 import { compactToolResults } from "@/lib/research/context";
 import { compileFallbackReport } from "@/lib/research/fallback";
+import { deleteRun, isValidRunId, loadRun, newRunId, saveRun } from "@/lib/research/run-store";
 import { checkReport, minNotesFor } from "@/lib/research/quality";
 import { buildDiagram, type BuiltDiagram } from "@/lib/research/diagram";
 import { normalizeVedicUrl, urlKey } from "@/lib/vedic-url";
@@ -40,7 +41,14 @@ const requestSchema = z.object({
   deliverables: z
     .object({ pdf: z.boolean().default(true), diagrams: z.boolean().default(true) })
     .default({ pdf: true, diagrams: true }),
+  /** Set when the app is continuing a run that outgrew one request. */
+  runId: z.string().optional(),
+  resume: z.boolean().default(false),
 });
+
+/** The app sends this as a hidden message to continue a run; it is never shown or sent to the model. */
+const CONTINUE_SENTINEL = "[[continue]]";
+const MAX_SEGMENTS = 16;
 
 const MAX_QUERY_LENGTH = 2_000;
 const DOCUMENT_CHUNK_LENGTH = 22_000;
@@ -50,10 +58,13 @@ const MAX_LEDGER_CHARS = 60_000;
 const MAX_DIAGRAMS = 3;
 const BOOTSTRAP_SEARCHES = 6;
 
-// A Vercel function is killed at 300 s; everything below keeps a report deliverable before that.
-const lateMs = () => (process.env.VERCEL ? 200_000 : getTimeBudgetMs() * 1.2);
-const slowMs = () => (process.env.VERCEL ? 140_000 : getTimeBudgetMs());
-const watchdogMs = () => (process.env.VERCEL ? 255_000 : getTimeBudgetMs() + 180_000);
+// A Vercel function is killed at 300 s, so a long run is split into segments: each does as much as it
+// safely can, saves its state, and the app resumes it with a fresh request. There is no overall limit
+// beyond RESEARCH_MAX_MINUTES (a runaway guard) and MAX_SEGMENTS.
+const SEGMENT_RESEARCH_MS = process.env.VERCEL ? 150_000 : Number.POSITIVE_INFINITY;
+// Writing (analysis, diagrams, the report) needs ~150 s of room; if less is left, start it next segment.
+const SEGMENT_WRITE_START_MS = process.env.VERCEL ? 120_000 : Number.POSITIVE_INFINITY;
+const SEGMENT_HARD_MS = process.env.VERCEL ? 262_000 : Number.POSITIVE_INFINITY;
 
 type Note = { url: string; title: string; note: string; quote?: string; subQuestion?: number };
 type Plan = { reportTitle: string; subQuestions: string[]; searchTerms: string[] };
@@ -72,7 +83,13 @@ type RunState = {
   diagramAttempts: number;
   analysis?: Analysis;
   analysisAttempts: number;
-  startedAt: number;
+  /** When the run began (across segments); the overall time guard is measured from here. */
+  runStartedAt: number;
+  segments: number;
+  segmentOver: boolean;
+  /** Consecutive segments that made no progress; too many and the run falls back. */
+  stalls: number;
+  hits: { title: string; url: string; snippet: string }[];
   /** Every same-site link found on pages that were read, by canonical key. */
   linkPool: Map<string, { title: string; url: string }>;
   readKeys: Set<string>;
@@ -188,9 +205,77 @@ function formatLedger(state: RunState): string {
   return text;
 }
 
+type SavedRun = Omit<RunState, "retrieved" | "linkPool" | "readKeys"> & {
+  retrieved: string[];
+  linkPool: [string, { title: string; url: string }][];
+  readKeys: string[];
+};
+
+function freshState(now: number): RunState {
+  return {
+    notes: [],
+    retrieved: new Set(),
+    diagrams: [],
+    coverageChecks: 0,
+    readyToWrite: false,
+    searches: 0,
+    reads: 0,
+    diagramAttempts: 0,
+    analysisAttempts: 0,
+    runStartedAt: now,
+    segments: 1,
+    segmentOver: false,
+    stalls: 0,
+    hits: [],
+    linkPool: new Map(),
+    readKeys: new Set(),
+    readsAfterFirstCheck: 0,
+    reportAttempts: 0,
+    accepted: false,
+    finalizing: false,
+    qualityIssues: [],
+    errors: [],
+    fallbackSent: false,
+    abandon: false,
+  };
+}
+
+function serializeState(state: RunState): SavedRun {
+  return { ...state, retrieved: [...state.retrieved], linkPool: [...state.linkPool], readKeys: [...state.readKeys] };
+}
+
+function hydrateState(saved: SavedRun): RunState {
+  return {
+    ...freshState(saved.runStartedAt),
+    ...saved,
+    retrieved: new Set(saved.retrieved),
+    linkPool: new Map(saved.linkPool),
+    readKeys: new Set(saved.readKeys),
+    segmentOver: false,
+    finalizing: false,
+    fallbackSent: false,
+  };
+}
+
+/** A number that grows whenever a segment gets somewhere; equal before and after means it stalled. */
+function progressOf(state: RunState): number {
+  return state.notes.length * 3 + state.searches + state.reads + state.coverageChecks + state.diagrams.length * 2 +
+    (state.analysis ? 5 : 0) + state.reportAttempts * 4 + (state.plan ? 1 : 0);
+}
+
 function recordError(state: RunState, message: string) {
   const short = message.split("\n")[0].slice(0, 240);
   if (!state.errors.includes(short) && state.errors.length < 8) state.errors.push(short);
+}
+
+function addHits(state: RunState, results: { title: string; url: string; snippet: string }[]) {
+  for (const result of results) {
+    if (state.hits.length >= 40) return;
+    const key = urlKey(result.url);
+    if (key && !state.hits.some((hit) => urlKey(hit.url) === key)) {
+      state.hits.push({ title: result.title, url: result.url, snippet: normalizeScrapedText(result.snippet).slice(0, 320) });
+    }
+  }
 }
 
 function remember(state: RunState, url: unknown) {
@@ -263,6 +348,7 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
         const initialResults: { title: string; url: string; snippet: string }[] = [];
         for (const outcome of settled) {
           if (outcome.status !== "fulfilled") continue;
+          addHits(state, outcome.value);
           for (const result of outcome.value) {
             remember(state, result.url);
             const key = urlKey(result.url);
@@ -308,6 +394,7 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
           const results = await searchVedicKnowledgeBase(query);
           console.info(`[research] search "${query.slice(0, 40)}" ${Date.now() - started}ms -> ${results.length}`);
           results.forEach((result) => remember(state, result.url));
+          addHits(state, results);
           return {
             query,
             results: results.map((result) => ({
@@ -463,7 +550,7 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
         const leadTarget = depth === "standard" ? 0 : depth === "deep" ? 3 : 6;
         const leadsPending = state.readsAfterFirstCheck < leadTarget && leads.length > 0;
         // Out of time (or checked repeatedly): proceed with what exists; the report must say what is missing.
-        const outOfTime = Date.now() - state.startedAt >= getTimeBudgetMs() * 0.8 || state.coverageChecks >= 4;
+        const outOfTime = Date.now() - state.runStartedAt >= getTimeBudgetMs() * 0.8 || state.coverageChecks >= 4;
         state.readyToWrite = outOfTime || (gaps.length === 0 && !thin && !leadsPending);
 
         const problems = [
@@ -568,7 +655,7 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
           relaxed: state.finalizing,
         });
         // Late in the run there is no time for another rewrite: deliver what exists, with its issues noted.
-        const late = Date.now() - state.startedAt > lateMs();
+        const late = Date.now() - state.runStartedAt > getTimeBudgetMs();
         const final = state.finalizing || late || state.reportAttempts >= 4;
         const wordCount = markdown.trim().split(/\s+/).filter(Boolean).length;
         if (final && wordCount < 150) {
@@ -665,33 +752,31 @@ export async function POST(request: NextRequest) {
   }
 
   prewarmScraper();
-  const messages = parsed.data.messages as UIMessage[];
+  const allMessages = parsed.data.messages as UIMessage[];
+  const isContinue = (message: UIMessage) =>
+    message.role === "user" && message.parts.some((part) => part.type === "text" && part.text === CONTINUE_SENTINEL);
+  // The model sees the conversation up to the real question. A run's earlier segments are not replayed:
+  // their plan, notes and analysis come back through the saved state and the notes in the system prompt.
+  let lastReal = -1;
+  allMessages.forEach((message, index) => {
+    if (message.role === "user" && !isContinue(message)) lastReal = index;
+  });
+  if (lastReal < 0) return NextResponse.json({ error: "Ask a question first." }, { status: 400 });
+  const messages = allMessages.slice(0, lastReal + 1);
+
   const depth = parsed.data.depth;
   const ceiling = getStepCeiling(depth);
-  const startedAt = Date.now();
+  const segmentStart = Date.now();
   const deliverables = parsed.data.deliverables;
-  const state: RunState = {
-    notes: [],
-    retrieved: new Set(),
-    diagrams: [],
-    coverageChecks: 0,
-    readyToWrite: false,
-    searches: 0,
-    reads: 0,
-    diagramAttempts: 0,
-    analysisAttempts: 0,
-    startedAt,
-    linkPool: new Map(),
-    readKeys: new Set(),
-    readsAfterFirstCheck: 0,
-    reportAttempts: 0,
-    accepted: false,
-    finalizing: false,
-    qualityIssues: [],
-    errors: [],
-    fallbackSent: false,
-    abandon: false,
-  };
+
+  const requestedRun = parsed.data.runId && isValidRunId(parsed.data.runId) ? parsed.data.runId : undefined;
+  const saved = parsed.data.resume && requestedRun ? await loadRun<SavedRun>(requestedRun) : undefined;
+  const runId = saved ? requestedRun! : newRunId();
+  const state = saved ? hydrateState(saved) : freshState(segmentStart);
+  if (saved) state.segments += 1;
+  const progressAtStart = progressOf(state);
+  console.info(`[research] ${saved ? `resuming ${runId} (segment ${state.segments})` : `new run ${runId}`}`);
+
   const baseSystem = buildSystemPrompt(parsed.data.language, depth, deliverables);
   const modelName = process.env.MISTRAL_MODEL || DEFAULT_MODEL;
 
@@ -702,14 +787,17 @@ export async function POST(request: NextRequest) {
 
     const stream = createUIMessageStream({
       execute: async ({ writer }) => {
-        // The safety net: if no accepted report exists when the run ends, however it ends, the reader
-        // still gets a report compiled from the saved notes (and so a PDF), never a blank screen.
+        writer.write({ type: "data-run", data: { runId } });
+
+        // The safety net: if the run cannot continue, the reader still gets a report compiled from the
+        // saved notes (and so a PDF), never a blank screen.
         const deliverFallback = (reason: string) => {
           if (state.accepted || state.fallbackSent) return;
           state.fallbackSent = true;
           const fallback = compileFallbackReport({
             plan: state.plan,
             notes: state.notes,
+            hits: state.hits,
             analysis: state.analysis,
             errors: state.errors,
             reason,
@@ -718,11 +806,14 @@ export async function POST(request: NextRequest) {
           writer.write({ type: "data-report", data: fallback });
         };
 
-        // A function killed at its time limit sends nothing at all, so give up a little earlier.
-        const watchdog = setTimeout(() => {
-          deliverFallback("the run ran out of time before a full report could be written");
-          controller.abort();
-        }, watchdogMs());
+        // A function killed at its time limit sends nothing at all, so end the segment a little earlier.
+        // This is not a failure: the state is saved and the app continues the run in a new request.
+        const watchdog = Number.isFinite(SEGMENT_HARD_MS)
+          ? setTimeout(() => {
+              state.segmentOver = true;
+              controller.abort();
+            }, SEGMENT_HARD_MS)
+          : undefined;
 
         try {
           const result = streamText({
@@ -730,59 +821,65 @@ export async function POST(request: NextRequest) {
             system: baseSystem,
             messages: modelMessages,
             tools: getTools(state, depth),
-            stopWhen: [stepCountIs(ceiling), () => state.accepted || state.abandon],
+            stopWhen: [stepCountIs(ceiling), () => state.accepted || state.abandon || state.segmentOver],
             maxOutputTokens: 16_000,
             // Low-cost API tiers rate-limit; retry with backoff instead of failing a long run.
             maxRetries: 6,
             abortSignal: controller.signal,
             onStepFinish: (step) => {
               const calls = step.toolCalls.map((call) => call.toolName).join(",") || "text";
+              const elapsed = Date.now() - segmentStart;
               console.info(
-                `[research] ${Math.round((Date.now() - startedAt) / 1000)}s step ${step.response.messages.length ? "done" : ""} tools=${calls} tokens=${step.usage.totalTokens}`,
+                `[research] seg${state.segments} ${Math.round(elapsed / 1000)}s tools=${calls} tokens=${step.usage.totalTokens}`,
               );
+              // End the segment at a step boundary once its time is used: research stops early enough to
+              // save state, and the writing phase only starts when there is room to finish it.
+              if (!state.accepted && !state.abandon) {
+                const writing = state.readyToWrite || state.finalizing;
+                if (writing ? elapsed > SEGMENT_WRITE_START_MS : elapsed > SEGMENT_RESEARCH_MS) state.segmentOver = true;
+              }
             },
             prepareStep: ({ stepNumber, messages: stepMessages }) => {
               const { note, finalize } = getStepGuidance(
                 depth,
                 stepNumber,
-                Date.now() - startedAt,
+                Date.now() - state.runStartedAt,
                 ceiling,
                 getTimeBudgetMs(),
               );
               const steer = [note, progressNote(state, depth)].filter(Boolean).join("\n");
               const system = `${baseSystem}${formatLedger(state)}${steer ? `\n\n${steer}` : ""}`;
-              const messages = compactToolResults(stepMessages);
+              const stepMessagesCompact = compactToolResults(stepMessages);
 
-              // Tools stay defined at every step (a model that emits a call to a "removed" tool crashes the
-              // run); steering is by toolChoice, and each tool guards itself against being used out of turn.
+              // Tools stay defined at every step (a model that emits a call to a "removed" tool crashes
+              // the run); steering is by toolChoice, and each tool guards itself against misuse.
               // Think first: the very first action is the research plan.
               if (!state.plan && !finalize) {
-                return { system, messages, toolChoice: { type: "tool" as const, toolName: "plan_research" as const } };
+                return { system, messages: stepMessagesCompact, toolChoice: { type: "tool" as const, toolName: "plan_research" as const } };
               }
-              if (state.accepted) return { system, messages, toolChoice: "none" as const };
-              // Out of budget: deliver the best honest report from what exists (checked leniently).
+              if (state.accepted) return { system, messages: stepMessagesCompact, toolChoice: "none" as const };
+              // The run's overall guard was reached: deliver the best honest report from what exists.
               if (finalize) {
                 state.finalizing = true;
-                return { system, messages, toolChoice: { type: "tool" as const, toolName: "submit_report" as const } };
+                return { system, messages: stepMessagesCompact, toolChoice: { type: "tool" as const, toolName: "submit_report" as const } };
               }
-              // Coverage confirmed: analyse, optionally draw grounded diagrams, then submit the report.
+              // Coverage confirmed: analyse, draw grounded diagrams, then submit the report.
               if (state.readyToWrite) {
-                const slow = Date.now() - startedAt > slowMs(); // no time for extras: write the report now
-                if (!slow && !state.analysis && state.analysisAttempts < 3) {
-                  return { system, messages, toolChoice: { type: "tool" as const, toolName: "analyze_evidence" as const } };
+                if (!state.analysis && state.analysisAttempts < 3) {
+                  return { system, messages: stepMessagesCompact, toolChoice: { type: "tool" as const, toolName: "analyze_evidence" as const } };
                 }
-                if (!slow && deliverables.diagrams && state.diagrams.length === 0 && state.diagramAttempts < 3) {
-                  return { system, messages, toolChoice: { type: "tool" as const, toolName: "create_diagram" as const } };
+                if (deliverables.diagrams && state.diagrams.length === 0 && state.diagramAttempts < 3) {
+                  return { system, messages: stepMessagesCompact, toolChoice: { type: "tool" as const, toolName: "create_diagram" as const } };
                 }
-                return { system, messages, toolChoice: { type: "tool" as const, toolName: "submit_report" as const } };
+                return { system, messages: stepMessagesCompact, toolChoice: { type: "tool" as const, toolName: "submit_report" as const } };
               }
               // Still researching: the model must keep using tools until check_coverage clears it.
-              return { system, messages, toolChoice: "required" as const };
+              return { system, messages: stepMessagesCompact, toolChoice: "required" as const };
             },
           });
 
-          // Provider hiccups must not blank the screen: drop stream errors (they are logged and
-          // handled by the fallback below) instead of forwarding them to the client.
+          // Provider hiccups must not blank the screen: drop stream errors (they are logged and handled
+          // below) instead of forwarding them to the client.
           writer.merge(
             result
               .toUIMessageStream({
@@ -808,16 +905,34 @@ export async function POST(request: NextRequest) {
           console.error("Research run failed:", error);
           recordError(state, error instanceof Error ? error.message : "The research run failed.");
         } finally {
-          clearTimeout(watchdog);
+          if (watchdog) clearTimeout(watchdog);
         }
 
-        if (!state.accepted) {
+        // Decide what happens next: finished, continue in a new request, or give up with the fallback.
+        if (state.accepted) {
+          await deleteRun(runId);
+          return;
+        }
+        if (state.abandon) {
+          await deleteRun(runId);
+          deliverFallback("the report could not be written to the required standard");
+          return;
+        }
+        const overBudget = Date.now() - state.runStartedAt > getTimeBudgetMs() * 1.15;
+        const stalled = progressOf(state) === progressAtStart;
+        state.stalls = stalled ? state.stalls + 1 : 0;
+        if (state.segments >= MAX_SEGMENTS || overBudget || state.stalls >= 3) {
+          await deleteRun(runId);
           deliverFallback(
             state.notes.length > 0
-              ? "the run ended before a full report could be written"
+              ? "the run could not be completed within its limits"
               : "the run ended before any evidence could be gathered",
           );
+          return;
         }
+        state.segmentOver = false;
+        await saveRun(runId, serializeState(state));
+        writer.write({ type: "data-continue", data: { runId, segment: state.segments } });
       },
     });
 

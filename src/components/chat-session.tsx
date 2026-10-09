@@ -2,7 +2,7 @@
 
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport, type UIMessage } from "ai";
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { GlassPanel } from "@/components/glass-panel";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { PdfViewer } from "@/components/pdf-viewer";
@@ -48,6 +48,28 @@ function plainText(message: MessageLike) {
     .filter((part) => part.type === "text" && typeof part.text === "string")
     .map((part) => part.text)
     .join("");
+}
+
+/** A hidden message the app sends to continue a run that outgrew one request. */
+const CONTINUE_SENTINEL = "[[continue]]";
+const MAX_AUTO_CONTINUES = 20;
+
+const isContinueMessage = (message: { role: string; parts?: { type: string; text?: string }[] }) =>
+  message.role === "user" && (message.parts ?? []).some((part) => part.type === "text" && part.text === CONTINUE_SENTINEL);
+
+type Turn = { user: UIMessage; assistants: UIMessage[] };
+
+/** Groups messages into questions and the assistant segments that answered them (continue messages are hidden). */
+function toTurns(messages: UIMessage[]): Turn[] {
+  const turns: Turn[] = [];
+  for (const message of messages) {
+    if (message.role === "user") {
+      if (!isContinueMessage(message as MessageLike)) turns.push({ user: message, assistants: [] });
+    } else if (turns.length > 0) {
+      turns[turns.length - 1].assistants.push(message);
+    }
+  }
+  return turns;
 }
 
 export function ChatSession({
@@ -154,10 +176,8 @@ export function ChatSession({
     return { analysis, markdown: markdown ? `${notice}${markdown}` : markdown };
   }
 
-  async function createPdf(message: UIMessage, index: number) {
+  async function createPdf(message: UIMessage, questionText: string) {
     const { analysis, markdown } = reportFor(message);
-    const question = [...messages.slice(0, index)].reverse().find((m) => m.role === "user");
-    const questionText = question ? plainText(question as MessageLike) : "";
     const title = analysis.plan?.reportTitle || questionText.slice(0, 120) || "Research report";
     setPdfs((current) => ({ ...current, [message.id]: { status: "working" } }));
 
@@ -194,19 +214,47 @@ export function ChatSession({
     setPdfs((current) => ({ ...current, [message.id]: { status: "error", message: lastError } }));
   }
 
-  // At the end of a run, produce the PDF automatically when that deliverable is selected.
+  const turns = toTurns(messages);
+  const mergedFor = (turn: Turn): UIMessage | undefined => {
+    const last = turn.assistants[turn.assistants.length - 1];
+    return last ? ({ ...last, parts: turn.assistants.flatMap((segment) => segment.parts) } as UIMessage) : undefined;
+  };
+
+  // A long run is split into several requests by the server; the app resumes it by itself until it
+  // finishes. Stopping it by hand turns that off and offers a Resume button instead.
+  const userStoppedRef = useRef(false);
+  const continuesRef = useRef(0);
+  async function continueRun(runId: string) {
+    continuesRef.current += 1;
+    setNotice("");
+    try {
+      await sendMessage({ text: CONTINUE_SENTINEL }, { body: { depth, language, deliverables, runId, resume: true } });
+    } catch (continueError) {
+      setNotice(continueError instanceof Error ? continueError.message : "Could not continue the research.");
+    }
+  }
+
   const previousStatus = useRef(status);
   useEffect(() => {
     // A run can end with an error after the report was already delivered (or a fallback compiled), so
-    // the PDF is produced whenever a finished run left a report, however it ended.
+    // each end of a request is examined whatever the status says.
     const wasRunning = previousStatus.current === "submitted" || previousStatus.current === "streaming";
-    const finishedRun = wasRunning && (status === "ready" || status === "error");
+    const requestEnded = wasRunning && (status === "ready" || status === "error");
     previousStatus.current = status;
-    if (!finishedRun || !deliverables.pdf) return;
-    const index = messages.length - 1;
-    const last = messages[index];
-    if (last?.role === "assistant" && analyzeMessage(last as MessageLike).text.trim().length > 200) {
-      void createPdf(last, index);
+    if (!requestEnded) return;
+
+    const lastTurn = toTurns(messagesRef.current).at(-1);
+    const merged = lastTurn ? mergedFor(lastTurn) : undefined;
+    if (!lastTurn || !merged) return;
+    const analysis = analyzeMessage(merged as MessageLike);
+
+    if (analysis.continueRunId && !userStoppedRef.current && continuesRef.current < MAX_AUTO_CONTINUES) {
+      void continueRun(analysis.continueRunId);
+      return;
+    }
+    // Finished: produce the PDF automatically when that deliverable is selected.
+    if (analysis.finished && deliverables.pdf && analysis.text.trim().length > 200) {
+      void createPdf(merged, plainText(lastTurn.user as MessageLike));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
@@ -217,6 +265,8 @@ export function ChatSession({
     if (!text || isBusy) return;
     setDraft("");
     setNotice("");
+    userStoppedRef.current = false;
+    continuesRef.current = 0;
     try {
       await sendMessage({ text }, { body: { depth, language, deliverables } });
     } catch (sendError) {
@@ -317,23 +367,26 @@ export function ChatSession({
             </div>
           </div>
         ) : (
-          messages.map((message, index) => {
-            if (message.role === "user") {
-              return (
-                <div key={message.id} className="ml-auto max-w-3xl">
+          turns.map((turn, turnIndex) => {
+            const message = mergedFor(turn);
+            const isLastTurn = turnIndex === turns.length - 1;
+            const { analysis, markdown } = message
+              ? reportFor(message)
+              : { analysis: analyzeMessage({ id: "pending", role: "assistant", parts: [] }), markdown: "" };
+            const resumable = isLastTurn && !isBusy && !analysis.finished && Boolean(analysis.continueRunId);
+            // Between segments the run is still going (the next request starts at once), so it counts as live.
+            const live = isLastTurn && (isBusy || (resumable && !userStoppedRef.current && continuesRef.current < MAX_AUTO_CONTINUES));
+            const hasReport = analysis.text.trim().length > 0;
+            const pdf = message ? pdfs[message.id] : undefined;
+            return (
+              <Fragment key={turn.user.id}>
+                <div className="ml-auto max-w-3xl">
                   <div className="rounded-3xl rounded-br-md border border-cream-400/60 bg-white/65 px-5 py-4 text-sm leading-7 text-cream-900 shadow-sm">
-                    {plainText(message as MessageLike)}
+                    {plainText(turn.user as MessageLike)}
                   </div>
                 </div>
-              );
-            }
-            const isLast = index === messages.length - 1;
-            const live = isBusy && isLast;
-            const { analysis, markdown } = reportFor(message);
-            const hasReport = analysis.text.trim().length > 0;
-            const pdf = pdfs[message.id];
-            return (
-              <article key={message.id} className="max-w-4xl">
+                {(message || live) && (
+              <article className="max-w-4xl">
                 {analysis.plan && (
                   <details open={!hasReport} className="mb-4 rounded-2xl border border-cream-300 bg-white/45 px-4 py-3 text-sm text-cream-900">
                     <summary className="cursor-pointer text-xs font-medium uppercase tracking-[0.14em] text-cream-700">
@@ -359,6 +412,8 @@ export function ChatSession({
                 )}
                 {hasReport ? (
                   <MarkdownRenderer content={markdown} />
+                ) : resumable && !live ? (
+                  <p className="text-sm text-cream-700">The research is paused.</p>
                 ) : !live ? (
                   <p role="alert" className="rounded-2xl border border-amber-400/60 bg-amber-50/80 px-4 py-3 text-sm text-amber-950">
                     This run ended before any report was delivered (the connection may have dropped). Please ask again.
@@ -367,6 +422,19 @@ export function ChatSession({
                   <span className="sr-only">Research in progress</span>
                 )}
 
+                {resumable && !live && analysis.continueRunId && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      userStoppedRef.current = false;
+                      continuesRef.current = 0;
+                      void continueRun(analysis.continueRunId!);
+                    }}
+                    className="mt-4 rounded-full bg-cream-900 px-5 py-2.5 text-xs font-medium text-cream-50 transition hover:bg-cream-700"
+                  >
+                    Resume research
+                  </button>
+                )}
                 {hasReport && !live && pdf && (
                   <div className="mt-5 flex flex-wrap items-center gap-3 rounded-2xl border border-cream-300 bg-white/45 px-4 py-3 text-sm">
                     {pdf.status === "working" && (
@@ -398,6 +466,8 @@ export function ChatSession({
                   </div>
                 )}
               </article>
+                )}
+              </Fragment>
             );
           })
         )}
@@ -445,7 +515,10 @@ export function ChatSession({
           {isBusy ? (
             <button
               type="button"
-              onClick={stop}
+              onClick={() => {
+                userStoppedRef.current = true;
+                stop();
+              }}
               className="mb-0.5 rounded-full border border-cream-400 bg-cream-100 px-4 py-2.5 text-xs font-medium text-cream-900 transition hover:bg-cream-200"
             >
               Stop

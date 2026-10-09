@@ -19,6 +19,10 @@ export type Analysis = {
   activity?: string;
   /** Why the delivered report fell short of the quality bar, if it did (e.g. the run ran out of time). */
   qualityIssues: string[];
+  /** A report (accepted or compiled by the server) exists: nothing more will happen for this question. */
+  finished: boolean;
+  /** Set when the server saved the run to continue it in another request; the app resumes it. */
+  continueRunId?: string;
 };
 
 const ACTIVITY: Record<string, string> = {
@@ -48,6 +52,7 @@ export function analyzeMessage(message: MessageLike): Analysis {
   let reportMarkdown: string | undefined;
   let reportAccepted = false;
   let qualityIssues: string[] = [];
+  let continueRunId: string | undefined;
   let fallbackMarkdown: string | undefined;
   let fallbackIssues: string[] = [];
 
@@ -62,6 +67,11 @@ export function analyzeMessage(message: MessageLike): Analysis {
 
   let lastToolIndex = -1;
   parts.forEach((part, index) => {
+    if (part.type === "data-continue") {
+      const data = (part as unknown as { data?: { runId?: unknown } }).data;
+      if (data && typeof data.runId === "string") continueRunId = data.runId;
+      return;
+    }
     if (part.type === "data-report" && isObject((part as { data?: unknown }).data)) {
       // Compiled by the server from the saved notes when no normal report could be delivered.
       const data = (part as unknown as { data: Record<string, unknown> }).data;
@@ -163,5 +173,6 @@ export function analyzeMessage(message: MessageLike): Analysis {
     reportMarkdown ??
     (parts.some((part) => part.type === "tool-submit_report") ? "" : legacyText);
   if (!delivered && fallbackMarkdown) qualityIssues = fallbackIssues;
-  return { text, plan, sources, notes, diagrams, counts, activity, qualityIssues };
+  const finished = reportAccepted || fallbackMarkdown !== undefined;
+  return { text, plan, sources, notes, diagrams, counts, activity, qualityIssues, finished, continueRunId: finished ? undefined : continueRunId };
 }

@@ -46,7 +46,7 @@ export function buildSystemPrompt(
 ): string {
   const diagramRules = deliverables.diagrams
     ? `DIAGRAMS
-- After your analysis, build one diagram (and up to two more if they help) with create_diagram: pick the most important relationships among concepts, texts, or stages that the pages explicitly state. Prefer diagrams that show structure the prose cannot show at a glance: a hierarchy, a sequence, a dependency, or how two texts relate.
+- After your analysis, build one rich diagram (and up to two more if they help) with create_diagram: 6 to 12 concepts connected by at least 6 labelled relationships that the pages explicitly state (a thin diagram of 2-3 boxes is rejected). Capture the real structure of the answer: what supports what, what leads to what, how the texts differ. Prefer diagrams that show structure the prose cannot show at a glance: a hierarchy, a sequence, a dependency, or how two texts relate.
 - A diagram may contain only relationships that the retrieved pages explicitly state. Every relationship must cite the page that states it, and its label should use the source's own terms. Never draw a relationship you inferred, remembered, or find "obvious".
 - You never write diagram syntax yourself. create_diagram returns an id such as D1; put the line [[diagram:D1]] in the report where the diagram belongs, with a sentence introducing what it shows and why it matters.`
     : `DIAGRAMS

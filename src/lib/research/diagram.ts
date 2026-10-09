@@ -15,8 +15,10 @@ export type BuiltDiagram = {
   sources: string[];
 };
 
-const MAX_NODES = 14;
-const MAX_EDGES = 24;
+const MIN_NODES = 4;
+const MIN_EDGES = 4;
+const MAX_NODES = 16;
+const MAX_EDGES = 28;
 
 function label(text: string): string {
   return text
@@ -38,11 +40,11 @@ export function buildDiagram(
   id: string,
 ): { diagram: BuiltDiagram } | { error: string } {
   const { nodes, edges } = input;
-  if (nodes.length < 2 || nodes.length > MAX_NODES) {
-    return { error: `Use between 2 and ${MAX_NODES} nodes.` };
+  if (nodes.length < MIN_NODES || nodes.length > MAX_NODES) {
+    return { error: `A useful diagram has between ${MIN_NODES} and ${MAX_NODES} nodes; this one has ${nodes.length}. Include every key concept the sources connect.` };
   }
-  if (edges.length < 1 || edges.length > MAX_EDGES) {
-    return { error: `Use between 1 and ${MAX_EDGES} relationships.` };
+  if (edges.length < MIN_EDGES || edges.length > MAX_EDGES) {
+    return { error: `A useful diagram has between ${MIN_EDGES} and ${MAX_EDGES} labelled relationships; this one has ${edges.length}. Show how the concepts connect, each citing the page that states it.` };
   }
 
   // Ids are whatever the caller chose; the Mermaid ids are generated here so they are always valid.

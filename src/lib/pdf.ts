@@ -40,7 +40,8 @@ const STYLES = `
   th, td { border: 1px solid #d9cfb5; padding: 4pt 7pt; text-align: left; vertical-align: top; }
   code { font-family: ui-monospace, Menlo, monospace; font-size: 9.5pt; background: #f3eddc; padding: 0 3pt; border-radius: 3px; }
   pre { white-space: pre-wrap; }
-  pre.mermaid { text-align: center; background: none; page-break-inside: avoid; }
+  pre.mermaid { text-align: center; background: none; page-break-inside: avoid; margin: 14pt 0; }
+  pre.mermaid svg { max-width: 100%; height: auto; }
   .question { color: #4a4231; margin: 0 0 14pt; }
   .diagram-failed { color: #8a7d5c; font-style: italic; }
   .meta { color: #8a7d5c; font-size: 9pt; margin-bottom: 14pt; }

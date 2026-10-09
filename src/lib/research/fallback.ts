@@ -8,6 +8,8 @@ export type FallbackInput = {
   plan?: { reportTitle: string; subQuestions: string[] };
   notes: { note: string; quote?: string; subQuestion?: number }[];
   analysis?: { thesis: string; tensions: string[]; gaps: string[] };
+  /** Pages the searches surfaced (title, link, passage); used when no notes were saved. */
+  hits?: { title: string; url: string; snippet: string }[];
   /** Problems the tools reported (for example an expired vedic.study session). */
   errors: string[];
   /** Why the normal report could not be delivered, in plain words. */
@@ -17,9 +19,26 @@ export type FallbackInput = {
 export type FallbackReport = { markdown: string; issues: string[] };
 
 export function compileFallbackReport(input: FallbackInput): FallbackReport {
-  const { plan, notes, analysis, errors, reason } = input;
+  const { plan, notes, analysis, errors, reason, hits = [] } = input;
   const issues = [reason];
   const lines: string[] = [];
+
+  if (notes.length === 0 && hits.length > 0) {
+    // No notes were saved, but the searches did surface passages: give the reader those, honestly labelled.
+    lines.push("## Bottom line", "");
+    lines.push(
+      "The research could not read the full pages or write an analysis, so this is only what the searches surfaced: the most relevant passages found on vedic.study, with links so you can read them in full.",
+      "",
+    );
+    lines.push("## Passages the searches surfaced", "");
+    for (const hit of hits.slice(0, 15)) {
+      lines.push(`- **[${hit.title.replace(/[\[\]]/g, "")}](${hit.url})**: ${hit.snippet.replace(/\s+/g, " ").trim()}`);
+    }
+    lines.push("", "## Limitations and gaps", "");
+    lines.push(`- ${reason}`);
+    for (const error of [...new Set(errors)].slice(0, 4)) lines.push(`- A source problem was reported: ${error}`);
+    return { markdown: lines.join("\n"), issues };
+  }
 
   if (notes.length === 0) {
     lines.push("## Bottom line", "");

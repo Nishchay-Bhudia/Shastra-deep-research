@@ -732,6 +732,13 @@ async function readViaFetch(url: string): Promise<SourceDocument | undefined> {
         }
       };
       walk(main);
+      // Some pages keep their text outside <article>/<main>; if what was found is thin, use the whole body.
+      if (text.trim().length < 200 && main !== doc.body) {
+        const thin = text;
+        text = "";
+        walk(doc.body);
+        if (text.trim().length < thin.trim().length) text = thin;
+      }
       const content = text
         .split("\n")
         .map((line) => line.trim())
@@ -833,7 +840,11 @@ async function runRead(url: string): Promise<SourceDocument> {
           document.querySelector("h1")?.textContent?.trim() ||
           document.title ||
           window.location.pathname;
-        const content = (main as HTMLElement).innerText
+        let source = (main as HTMLElement).innerText;
+        if (source.trim().length < 200 && main !== document.body && document.body.innerText.trim().length > source.trim().length) {
+          source = document.body.innerText;
+        }
+        const content = source
           .replace(/\n{3,}/g, "\n\n")
           .trim()
           .slice(0, maxTextLength);
