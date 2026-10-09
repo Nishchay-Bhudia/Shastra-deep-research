@@ -23,6 +23,7 @@ const ACTIVITY: Record<string, string> = {
   plan_research: "Planning the research",
   search_knowledge_base: "Searching vedic.study",
   read_document: "Reading a source",
+  read_documents: "Reading a source",
   save_note: "Taking notes",
   check_coverage: "Checking coverage",
   analyze_evidence: "Analysing the evidence",
@@ -71,7 +72,23 @@ export function analyzeMessage(message: MessageLike): Analysis {
     if (part.state !== "output-available" || !isObject(part.output) || "error" in part.output) return;
     const output = part.output;
 
-    if (name === "search_knowledge_base") {
+    if (name === "plan_research") {
+      if (typeof output.searchesRun === "number") counts.searches += output.searchesRun;
+      if (Array.isArray(output.initialResults)) {
+        for (const result of output.initialResults) {
+          if (isObject(result)) addSource(result.url, result.title, true);
+        }
+      }
+    } else if (name === "read_documents" && Array.isArray(output.documents)) {
+      for (const doc of output.documents) {
+        if (!isObject(doc) || "error" in doc) continue;
+        counts.reads += 1;
+        if (Array.isArray(doc.links)) {
+          for (const link of doc.links) if (isObject(link)) addSource(link.url, link.text);
+        }
+        addSource(doc.url, doc.title, true);
+      }
+    } else if (name === "search_knowledge_base") {
       counts.searches += 1;
       if (Array.isArray(output.results)) {
         for (const result of output.results) {

@@ -22,6 +22,28 @@ function compactValue(toolName: string | undefined, value: unknown): unknown {
       content: `${data.content.slice(0, STUB_CHARS)} […older page text removed to save space; re-read the URL if needed]`,
     };
   }
+  if (toolName === "read_documents" && Array.isArray(data.documents)) {
+    return {
+      documents: data.documents.map((item) => {
+        const doc = item as { title?: string; url?: string; content?: string; error?: string };
+        return {
+          title: doc.title,
+          url: doc.url,
+          error: doc.error,
+          content: doc.content ? `${doc.content.slice(0, STUB_CHARS)} […older page text removed to save space]` : undefined,
+        };
+      }),
+    };
+  }
+  if (toolName === "plan_research" && Array.isArray(data.initialResults)) {
+    return {
+      ...data,
+      initialResults: data.initialResults.map((item) => {
+        const result = item as { title?: string; url?: string };
+        return { title: result.title, url: result.url };
+      }),
+    };
+  }
   if (toolName === "search_knowledge_base" && Array.isArray(data.results)) {
     return {
       query: data.query,

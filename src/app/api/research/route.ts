@@ -39,9 +39,11 @@ const requestSchema = z.object({
 
 const MAX_QUERY_LENGTH = 2_000;
 const DOCUMENT_CHUNK_LENGTH = 22_000;
+const BATCH_DOCUMENT_CHARS = 10_000;
 const MAX_NOTES = 300;
 const MAX_LEDGER_CHARS = 60_000;
 const MAX_DIAGRAMS = 3;
+const BOOTSTRAP_SEARCHES = 6;
 
 type Note = { url: string; title: string; note: string; quote?: string; subQuestion?: number };
 type Plan = { reportTitle: string; subQuestions: string[]; searchTerms: string[] };
@@ -97,7 +99,7 @@ function progressNote(state: RunState, depth: "standard" | "deep" | "really-deep
     return "Your search budget is used up. Read the most relevant pages, save notes, and call check_coverage.";
   }
   if (state.searches >= 3 && state.reads === 0) {
-    return "You have searched enough to choose sources. Now read the 3-6 most relevant pages with read_document (several in parallel), then save notes. Searching again without reading finds nothing new.";
+    return "You have searched enough to choose sources. Now read the 4-8 most relevant pages with read_documents (up to 5 per call), then save notes. Searching again without reading finds nothing new.";
   }
   if (state.reads > 0 && state.notes.length === 0) {
     return "You have read pages but saved no notes. Call save_note now for each important finding, with its sub-question number.";
@@ -186,9 +188,41 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
           searchTerms: input.searchTerms.slice(0, 40).map((t) => t.trim().slice(0, 120)),
         };
         state.plan = plan;
+
+        // Run the opening searches right here, in parallel, instead of spending several slow model
+        // round trips on them: the model's next step starts with candidate pages already in hand.
+        const started = Date.now();
+        const budget = Math.min(BOOTSTRAP_SEARCHES, getSearchBudget(depth));
+        const terms = [...new Set(plan.searchTerms)].slice(0, budget);
+        state.searches += terms.length;
+        const settled = await Promise.allSettled(terms.map((term) => searchVedicKnowledgeBase(term)));
+        const seen = new Set<string>();
+        const initialResults: { title: string; url: string; snippet: string }[] = [];
+        for (const outcome of settled) {
+          if (outcome.status !== "fulfilled") continue;
+          for (const result of outcome.value) {
+            remember(state, result.url);
+            const key = urlKey(result.url);
+            if (!key || seen.has(key) || initialResults.length >= 30) continue;
+            seen.add(key);
+            initialResults.push({
+              title: result.title,
+              url: result.url,
+              snippet: normalizeScrapedText(result.snippet).slice(0, 260),
+            });
+          }
+        }
+        const failures = settled.filter((outcome) => outcome.status === "rejected") as PromiseRejectedResult[];
+        console.info(`[research] bootstrap ${terms.length} searches in ${Date.now() - started}ms, ${initialResults.length} pages, ${failures.length} failed`);
         return {
           planned: true,
           subQuestions: plan.subQuestions.map((text, index) => ({ id: index + 1, text })),
+          searchesRun: terms.length,
+          initialResults,
+          note:
+            initialResults.length > 0
+              ? "Opening searches are done; these are candidate pages. Read the most relevant ones next with read_documents."
+              : `The opening searches found nothing${failures[0] ? ` (${String(failures[0].reason?.message ?? failures[0].reason).slice(0, 200)})` : ""}. Try search_knowledge_base with simpler or transliterated terms.`,
         };
       },
     }),
@@ -205,8 +239,10 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
         }
         const query = rawQuery.slice(0, MAX_QUERY_LENGTH);
         state.searches += 1;
+        const started = Date.now();
         try {
           const results = await searchVedicKnowledgeBase(query);
+          console.info(`[research] search "${query.slice(0, 40)}" ${Date.now() - started}ms -> ${results.length}`);
           results.forEach((result) => remember(state, result.url));
           return {
             query,
@@ -255,6 +291,45 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
         } catch (error) {
           return { error: error instanceof Error ? error.message : "Could not read the page." };
         }
+      },
+    }),
+    read_documents: tool({
+      description:
+        "Read up to 5 vedic.study pages at once (in parallel). Use this to read the pages you chose from search results; it is much faster than one page per step. Each page is returned up to 10,000 characters; for a long page (nextOffset is set) continue it with read_document and an offset.",
+      inputSchema: z.object({
+        urls: z.array(z.string().min(1)).min(1).describe("1-5 exact vedic.study URLs from search results or links."),
+      }),
+      execute: async ({ urls }) => {
+        if (state.readyToWrite) return { error: "Research is complete. Write the report now." };
+        const remaining = getReadBudget(depth) - state.reads;
+        if (remaining <= 0) {
+          return { error: "Reading budget used up. Save notes for what you read and call check_coverage." };
+        }
+        const batch = [...new Set(urls)].slice(0, Math.min(5, remaining));
+        state.reads += batch.length;
+        const started = Date.now();
+        const documents = await Promise.all(
+          batch.map(async (url) => {
+            try {
+              const document = await readVedicDocument(url);
+              remember(state, document.url);
+              document.links.forEach((link) => remember(state, link.url));
+              const normalized = normalizeScrapedText(document.content);
+              return {
+                title: document.title,
+                url: document.url,
+                content: normalized.slice(0, BATCH_DOCUMENT_CHARS),
+                totalLength: normalized.length,
+                nextOffset: normalized.length > BATCH_DOCUMENT_CHARS ? BATCH_DOCUMENT_CHARS : null,
+                links: document.links.slice(0, 12),
+              };
+            } catch (error) {
+              return { url, error: error instanceof Error ? error.message : "Could not read the page." };
+            }
+          }),
+        );
+        console.info(`[research] read_documents ${batch.length} pages in ${Date.now() - started}ms`);
+        return { documents };
       },
     }),
     save_note: tool({

@@ -12,6 +12,8 @@ const MAX_LINKS = 40;
 const NAVIGATION_TIMEOUT_MS = 25_000;
 const SETTLE_TIMEOUT_MS = 8_000;
 const GATE_GRACE_MS = 25_000;
+// Covers a cold start (launching Chromium, restoring the session) plus the page itself.
+const SCRAPER_DEADLINE_MS = process.env.VERCEL ? 75_000 : 60_000;
 const MAX_CONCURRENT_PAGES = process.env.VERCEL ? 2 : 3;
 const CACHE_TTL_MS = 10 * 60_000;
 const CACHE_MAX_ENTRIES = 150;
@@ -80,6 +82,7 @@ type ScraperGlobals = {
   __shastraBrowser?: Promise<Browser>;
   __shastraContext?: Promise<BrowserContext>;
   __shastraSessionPage?: Page;
+  __shastraLastUsed?: number;
 };
 const scraperGlobals = globalThis as unknown as ScraperGlobals;
 
@@ -111,6 +114,11 @@ function getSearchUrl(query: string): string {
 }
 
 async function getBrowser() {
+  const existing = scraperGlobals.__shastraBrowser;
+  if (existing) {
+    const browser = await existing.catch(() => undefined);
+    if (browser && !browser.isConnected()) await resetBrowser();
+  }
   if (!scraperGlobals.__shastraBrowser) {
     scraperGlobals.__shastraBrowser = launchChromium()
       .then((browser) => {
@@ -131,6 +139,58 @@ async function getBrowser() {
       });
   }
   return scraperGlobals.__shastraBrowser;
+}
+
+/** Forgets and kills the shared browser. A serverless instance can be frozen mid-run, leaving a dead Chromium behind. */
+async function resetBrowser() {
+  const pending = scraperGlobals.__shastraBrowser;
+  scraperGlobals.__shastraBrowser = undefined;
+  scraperGlobals.__shastraContext = undefined;
+  scraperGlobals.__shastraSessionPage = undefined;
+  const browser = await Promise.race([
+    pending?.catch(() => undefined),
+    new Promise<undefined>((resolve) => setTimeout(resolve, 3_000)),
+  ]);
+  void browser?.close().catch(() => undefined);
+}
+
+class ScraperTimeout extends Error {}
+
+/** Bounds a scraper call so a hung page can never hold a request (or a concurrency slot) until the function is killed. */
+async function withDeadline<T>(task: () => Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      task(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new ScraperTimeout(`The browser did not respond within ${Math.round(ms / 1000)}s.`)), ms);
+      }),
+    ]);
+  } catch (error) {
+    if (error instanceof ScraperTimeout) {
+      void resetBrowser(); // the next call starts from a clean browser
+      throw new Error(`${error.message} It was restarted; try again.`);
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+    scraperGlobals.__shastraLastUsed = Date.now();
+  }
+}
+
+/** After idle time the browser may have been frozen with its serverless instance; confirm it still answers. */
+async function ensureBrowserAlive() {
+  const last = scraperGlobals.__shastraLastUsed;
+  if (!scraperGlobals.__shastraContext || last === undefined || Date.now() - last < 15_000) return;
+  try {
+    const context = await scraperGlobals.__shastraContext;
+    await Promise.race([
+      context.newPage().then((page) => page.close()),
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error("unresponsive")), 8_000)),
+    ]);
+  } catch {
+    await resetBrowser();
+  }
 }
 
 const DEFAULT_STATE_PATH = ".auth/vedic-study.json";
@@ -404,7 +464,14 @@ async function withGateRetry<T>(task: () => Promise<T>): Promise<T> {
 
 export function searchVedicKnowledgeBase(query: string): Promise<SearchResult[]> {
   const key = `search:${query.trim().toLowerCase()}`;
-  return cached(key, () => pageLimiter.run(() => withGateRetry(() => runSearch(query))));
+  return cached(key, () =>
+    pageLimiter.run(() =>
+      withGateRetry(async () => {
+        await ensureBrowserAlive();
+        return withDeadline(() => runSearch(query), SCRAPER_DEADLINE_MS);
+      }),
+    ),
+  );
 }
 
 async function runSearch(query: string): Promise<SearchResult[]> {
@@ -529,7 +596,14 @@ export function readVedicDocument(url: string): Promise<SourceDocument> {
   if (!normalized) {
     return Promise.reject(new Error("Only HTTPS vedic.study URLs can be read."));
   }
-  return cached(`doc:${normalized}`, () => pageLimiter.run(() => withGateRetry(() => runRead(normalized))));
+  return cached(`doc:${normalized}`, () =>
+    pageLimiter.run(() =>
+      withGateRetry(async () => {
+        await ensureBrowserAlive();
+        return withDeadline(() => runRead(normalized), SCRAPER_DEADLINE_MS);
+      }),
+    ),
+  );
 }
 
 /**
