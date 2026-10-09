@@ -65,15 +65,21 @@ export function checkReport(input: QualityInput): QualityResult {
     style.push(`it cites note numbers that do not exist (${missing.join(", ")}); there are ${noteCount} notes`);
   }
   const distinct = new Set(cited.filter((n) => n >= 1 && n <= noteCount));
-  const minCited = relaxed ? Math.min(2, noteCount) : Math.min(Math.max(4, Math.ceil(noteCount * 0.4)), noteCount);
+  const minCited = relaxed ? Math.min(2, noteCount) : Math.min(Math.max(4, Math.ceil(noteCount * 0.25)), 10, noteCount);
   if (distinct.size < minCited) {
     style.push(`it cites only ${distinct.size} distinct notes; cite the evidence behind each claim (at least ${minCited} different notes)`);
   }
 
+  // Most questions should draw on the evidence gathered for them (one or two may be thin).
+  let unused = 0;
+  let withNotes = 0;
   for (let q = 1; q <= subQuestionCount; q += 1) {
-    const hasNotes = noteSubQuestions.some((n) => n === q);
-    const used = [...distinct].some((n) => noteSubQuestions[n - 1] === q);
-    if (hasNotes && !used && !relaxed) style.push(`it never uses the evidence you gathered for sub-question ${q}`);
+    if (!noteSubQuestions.some((n) => n === q)) continue;
+    withNotes += 1;
+    if (![...distinct].some((n) => noteSubQuestions[n - 1] === q)) unused += 1;
+  }
+  if (!relaxed && withNotes > 0 && unused > Math.floor(withNotes / 2)) {
+    style.push(`it ignores the evidence you gathered for ${unused} of ${withNotes} sub-questions; use it`);
   }
 
   if (!relaxed && noteCount < MIN_NOTES[depth]) {

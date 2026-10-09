@@ -20,6 +20,7 @@ import {
 } from "@/lib/research/config";
 import { compactToolResults } from "@/lib/research/context";
 import { compileFallbackReport } from "@/lib/research/fallback";
+import { normalizeLoose, normalizeNote, normalizePlan, normalizeReport, resolveSubQuestion } from "@/lib/research/lenient";
 import { deleteRun, isValidRunId, loadRun, newRunId, saveRun } from "@/lib/research/run-store";
 import { checkReport, minNotesFor } from "@/lib/research/quality";
 import { buildDiagram, type BuiltDiagram } from "@/lib/research/diagram";
@@ -318,17 +319,20 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
         "Your required first action. Plan the research before searching: a descriptive report title, the sub-questions to answer, and search terms in several scripts.",
       // Limits are enforced in execute, not by the schema: a model that writes one item too many
       // should be trimmed, not fail validation and derail the run.
-      inputSchema: z.object({
-        reportTitle: z
-          .string()
-          .min(1)
-          .describe('Short descriptive title (under 90 characters) that names the subject, e.g. "Dharma in the Shikshapatri". Used as the PDF filename.'),
-        subQuestions: z.array(z.string().min(1)).min(1).describe("2-6 sub-questions the report must answer."),
-        searchTerms: z
-          .array(z.string().min(1))
-          .min(1)
-          .describe("Up to 20 terms in English, IAST transliteration, Devanagari, and Gujarati worth searching."),
-      }),
+      inputSchema: z.preprocess(
+        normalizePlan,
+        z.object({
+          reportTitle: z
+            .string()
+            .min(1)
+            .describe('Short descriptive title (under 90 characters) that names the subject, e.g. "Dharma in the Shikshapatri". Used as the PDF filename.'),
+          subQuestions: z.array(z.string().min(1)).min(1).describe("2-6 sub-questions the report must answer."),
+          searchTerms: z
+            .array(z.string().min(1))
+            .min(1)
+            .describe("Up to 20 terms in English, IAST transliteration, Devanagari, and Gujarati worth searching."),
+        }),
+      ),
       execute: async (input) => {
         const plan = {
           reportTitle: input.reportTitle.trim().slice(0, 90),
@@ -492,18 +496,19 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
     save_note: tool({
       description:
         "Save a finding to your research notes. Notes persist for the whole run while older tool results are compacted. Give the page URL and title exactly as a tool returned them, the number of the sub-question it answers, a precise note, and the exact quotation when relevant.",
-      inputSchema: z.object({
-        url: z.string().min(1),
-        title: z.string().min(1),
-        subQuestion: z.number().int().min(1).describe("Which planned sub-question this finding answers (1-based)."),
-        note: z.string().min(1),
-        quote: z.string().optional(),
-      }),
-      execute: async (entry) => {
-        const canonical = normalizeVedicUrl(entry.url);
-        if (state.plan && entry.subQuestion > state.plan.subQuestions.length) {
-          return { error: `There is no sub-question ${entry.subQuestion}; the plan has ${state.plan.subQuestions.length}.` };
-        }
+      inputSchema: z.preprocess(
+        normalizeNote,
+        z.object({
+          url: z.string().min(1),
+          title: z.string().min(1),
+          subQuestion: z.union([z.number(), z.string()]).describe("The number (1-based) of the planned sub-question this finding answers."),
+          note: z.string().min(1),
+          quote: z.string().optional(),
+        }),
+      ),
+      execute: async (input) => {
+        const canonical = normalizeVedicUrl(input.url);
+        const entry = { ...input, subQuestion: resolveSubQuestion(input.subQuestion, state.plan?.subQuestions ?? []) };
         if (!canonical || !state.retrieved.has(urlKey(canonical)!)) {
           return {
             error:
@@ -576,55 +581,73 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
     analyze_evidence: tool({
       description:
         "After check_coverage confirms readiness and before writing: state your thesis, what the evidence for each sub-question shows (with the supporting note numbers), how the sources relate, the tensions you found, what is still unanswered, and an outline for the report.",
-      inputSchema: z.object({
-        thesis: z.string().min(1).describe("The single most important, specific answer your evidence supports."),
-        findings: z
-          .array(
-            z.object({
-              subQuestion: z.number().int().min(1),
-              claim: z.string().min(1),
-              reasoning: z.string().min(1).describe("Why the cited notes support the claim and what follows from it."),
-              confidence: z.string().default("medium").describe('"high", "medium" or "low".'),
-              noteNumbers: z.array(z.number().int()).default([]),
-            }),
-          )
-          .min(1),
-        relationships: z
-          .array(
-            z.object({
-              kind: z.string().min(1).describe("agrees, qualifies, contradicts, develops, or a short label of your own."),
-              description: z.string().min(1),
-              noteNumbers: z.array(z.number().int()).default([]),
-            }),
-          )
-          .default([]),
-        tensions: z.array(z.string()).default([]),
-        gaps: z.array(z.string()).default([]),
-        outline: z.array(z.string()).default([]).describe("Headings of the report, in order."),
-      }),
+      inputSchema: z.preprocess(
+        normalizeLoose,
+        z.object({
+          thesis: z.string().default("").describe("The single most important, specific answer your evidence supports."),
+          findings: z
+            .array(
+              z.object({
+                subQuestion: z.union([z.number(), z.string()]).default(1),
+                claim: z.string().default(""),
+                reasoning: z.string().default("").describe("Why the cited notes support the claim and what follows from it."),
+                confidence: z.string().default("medium").describe('"high", "medium" or "low".'),
+                noteNumbers: z.array(z.number()).default([]),
+              }),
+            )
+            .default([]),
+          relationships: z
+            .array(
+              z.object({
+                kind: z.string().default("relates"),
+                description: z.string().default(""),
+                noteNumbers: z.array(z.number()).default([]),
+              }),
+            )
+            .default([]),
+          tensions: z.array(z.string()).default([]),
+          gaps: z.array(z.string()).default([]),
+          outline: z.array(z.string()).default([]).describe("Headings of the report, in order."),
+        }),
+      ),
       execute: async (input) => {
         if (!state.readyToWrite) return { error: "Finish the research and call check_coverage before analysing." };
         state.analysisAttempts += 1;
-        const cited = [...input.findings.flatMap((f) => f.noteNumbers), ...input.relationships.flatMap((r) => r.noteNumbers)];
-        const missing = [...new Set(cited.filter((n) => n < 1 || n > state.notes.length))];
-        if (missing.length > 0 && state.analysisAttempts < 3) {
-          return { error: `Note numbers ${missing.join(", ")} do not exist (there are ${state.notes.length} notes). Cite only saved notes.` };
-        }
-        const valid = (numbers: number[]) => numbers.filter((n) => n >= 1 && n <= state.notes.length);
-        state.analysis = {
-          thesis: input.thesis.slice(0, 1_200),
-          findings: input.findings.slice(0, 12).map((f) => ({
-            subQuestion: f.subQuestion,
+        const count = state.notes.length;
+        const valid = (numbers: number[]) => numbers.filter((n) => Number.isInteger(n) && n >= 1 && n <= count);
+        const subQuestions = state.plan?.subQuestions ?? [];
+
+        let findings = input.findings
+          .filter((f) => f.claim.trim() || f.reasoning.trim())
+          .slice(0, 12)
+          .map((f) => ({
+            subQuestion: resolveSubQuestion(f.subQuestion, subQuestions),
             claim: f.claim.slice(0, 700),
             reasoning: f.reasoning.slice(0, 1_000),
             confidence: f.confidence.slice(0, 20),
             noteNumbers: valid(f.noteNumbers),
-          })),
-          relationships: input.relationships.slice(0, 12).map((r) => ({
-            kind: r.kind.slice(0, 40),
-            description: r.description.slice(0, 700),
-            noteNumbers: valid(r.noteNumbers),
-          })),
+          }));
+        // A model that sends an empty or malformed analysis must not stall the run: build the findings
+        // from the notes themselves (each question with the notes that answer it).
+        if (findings.length === 0) {
+          findings = subQuestions.map((question, index) => ({
+            subQuestion: index + 1,
+            claim: question,
+            reasoning: "Evidence for this question was gathered in the notes cited here; compare them and state what they establish.",
+            confidence: "medium",
+            noteNumbers: state.notes
+              .map((note, noteIndex) => (note.subQuestion === index + 1 ? noteIndex + 1 : 0))
+              .filter(Boolean)
+              .slice(0, 12),
+          }));
+        }
+        state.analysis = {
+          thesis: input.thesis.trim().slice(0, 1_200) || (state.plan?.reportTitle ?? "The sources' answer to the question"),
+          findings,
+          relationships: input.relationships
+            .filter((r) => r.description.trim())
+            .slice(0, 12)
+            .map((r) => ({ kind: r.kind.slice(0, 40), description: r.description.slice(0, 700), noteNumbers: valid(r.noteNumbers) })),
           tensions: input.tensions.slice(0, 8).map((t) => t.slice(0, 500)),
           gaps: input.gaps.slice(0, 8).map((g) => g.slice(0, 400)),
           outline: input.outline.slice(0, 14).map((o) => o.slice(0, 120)),
@@ -635,12 +658,15 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
     submit_report: tool({
       description:
         "Deliver the finished report. Pass the complete report as Markdown. The report is checked before it is accepted: if it is too thin, opens with process talk, cites notes that do not exist, or ignores your evidence, it is rejected with the reasons and you must fix it and submit again (or research more if told to).",
-      inputSchema: z.object({
-        markdown: z
-          .string()
-          .min(1)
-          .describe("The complete report in Markdown: no preamble, no process talk, no sources list; begin with the bottom line."),
-      }),
+      inputSchema: z.preprocess(
+        normalizeReport,
+        z.object({
+          markdown: z
+            .string()
+            .min(1)
+            .describe("The complete report in Markdown: no preamble, no process talk, no sources list; begin with the bottom line."),
+        }),
+      ),
       execute: async ({ markdown }) => {
         if (!state.readyToWrite && !state.finalizing) {
           return { error: "Research is not complete yet. Continue researching and call check_coverage first." };
@@ -656,7 +682,7 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
         });
         // Late in the run there is no time for another rewrite: deliver what exists, with its issues noted.
         const late = Date.now() - state.runStartedAt > getTimeBudgetMs();
-        const final = state.finalizing || late || state.reportAttempts >= 4;
+        const final = state.finalizing || late || state.reportAttempts >= 3;
         const wordCount = markdown.trim().split(/\s+/).filter(Boolean).length;
         if (final && wordCount < 150) {
           // Not a report at all: deliver the digest compiled from the notes instead of this.
