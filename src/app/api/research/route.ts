@@ -17,6 +17,7 @@ import {
   getTimeBudgetMs,
 } from "@/lib/research/config";
 import { compactToolResults } from "@/lib/research/context";
+import { checkReport, minNotesFor } from "@/lib/research/quality";
 import { buildDiagram, type BuiltDiagram } from "@/lib/research/diagram";
 import { normalizeVedicUrl, urlKey } from "@/lib/vedic-url";
 import {
@@ -63,6 +64,15 @@ type RunState = {
   diagramAttempts: number;
   analysis?: Analysis;
   analysisAttempts: number;
+  startedAt: number;
+  /** Every same-site link found on pages that were read, by canonical key. */
+  linkPool: Map<string, { title: string; url: string }>;
+  readKeys: Set<string>;
+  readsAfterFirstCheck: number;
+  reportAttempts: number;
+  accepted: boolean;
+  finalizing: boolean;
+  qualityIssues: string[];
 };
 
 type Analysis = {
@@ -117,11 +127,18 @@ function progressNote(state: RunState, depth: "standard" | "deep" | "really-deep
  */
 function stripOldToolParts(messages: UIMessage[]): UIMessage[] {
   const lastIndex = messages.length - 1;
-  return messages.map((message, index) =>
-    index === lastIndex
-      ? message
-      : { ...message, parts: message.parts.filter((part) => !part.type.startsWith("tool-")) },
-  );
+  return messages.map((message, index) => {
+    if (index === lastIndex) return message;
+    const parts = (message.parts as { type: string; state?: string; input?: { markdown?: unknown }; output?: { accepted?: boolean } }[])
+      .map((part) =>
+        // A delivered report lives in a submit_report call; keep its text so follow-up questions have it.
+        part.type === "tool-submit_report" && part.output?.accepted === true && typeof part.input?.markdown === "string"
+          ? { type: "text" as const, text: part.input.markdown }
+          : part,
+      )
+      .filter((part) => !part.type.startsWith("tool-"));
+    return { ...message, parts } as UIMessage;
+  });
 }
 
 function formatLedger(state: RunState): string {
@@ -162,6 +179,33 @@ function remember(state: RunState, url: unknown) {
   if (typeof url !== "string") return;
   const key = urlKey(url);
   if (key) state.retrieved.add(key);
+}
+
+/** Records a page as read and collects the pages it links to, so the agent can follow where the text points. */
+function noteRead(state: RunState, document: { url: string; links: { text: string; url: string }[] }) {
+  const key = urlKey(document.url);
+  if (key) {
+    state.readKeys.add(key);
+    state.linkPool.delete(key);
+  }
+  if (state.coverageChecks >= 1) state.readsAfterFirstCheck += 1;
+  for (const link of document.links) {
+    const linkKey = urlKey(link.url);
+    if (linkKey && !state.readKeys.has(linkKey) && !state.linkPool.has(linkKey)) {
+      state.linkPool.set(linkKey, { title: link.text, url: link.url });
+    }
+  }
+}
+
+/** Unread pages linked from pages already read, nearest the saved evidence first (same text or chapter). */
+function pickLeads(state: RunState, limit: number) {
+  const prefix = (url: string) => new URL(url).pathname.split("/").filter(Boolean).slice(0, 3).join("/");
+  const noteDocs = new Set(state.notes.map((note) => prefix(note.url)));
+  return [...state.linkPool.values()]
+    .map((lead) => ({ lead, near: noteDocs.has(prefix(lead.url)) ? 0 : 1 }))
+    .sort((a, b) => a.near - b.near)
+    .slice(0, limit)
+    .map(({ lead }) => ({ title: lead.title, url: lead.url }));
 }
 
 function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
@@ -278,6 +322,7 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
           const document = await readVedicDocument(url);
           remember(state, document.url);
           document.links.forEach((link) => remember(state, link.url));
+          noteRead(state, document);
           const normalized = normalizeScrapedText(document.content);
           const end = offset + DOCUMENT_CHUNK_LENGTH;
           return {
@@ -315,6 +360,7 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
               const document = await readVedicDocument(url);
               remember(state, document.url);
               document.links.forEach((link) => remember(state, link.url));
+              noteRead(state, document);
               const normalized = normalizeScrapedText(document.content);
               return {
                 title: document.title,
@@ -376,11 +422,11 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
     }),
     check_coverage: tool({
       description:
-        "Call when you believe the research is complete. Reports which planned sub-questions still have no saved notes. You cannot write the report until this confirms you are ready.",
+        "Call when you believe the research is complete. Checks that every planned sub-question has saved notes, that you have enough well-sourced notes, and (for deep research) that you have followed the pages your sources point to. You cannot write the report until this confirms you are ready.",
       inputSchema: z.object({}),
       execute: async () => {
         if (!state.plan) return { error: "Plan the research first." };
-        if (state.readyToWrite) return { ready: true, message: "Coverage is already confirmed. Write the report now." };
+        if (state.readyToWrite) return { ready: true, message: "Coverage is already confirmed. Continue to your analysis." };
         state.coverageChecks += 1;
         const coverage = state.plan.subQuestions.map((text, index) => ({
           id: index + 1,
@@ -388,16 +434,32 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
           notes: state.notes.filter((entry) => entry.subQuestion === index + 1).length,
         }));
         const gaps = coverage.filter((item) => item.notes === 0);
-        // A second check accepts remaining gaps, which the report must then state honestly.
-        state.readyToWrite = gaps.length === 0 || state.coverageChecks >= 2;
+        const minNotes = minNotesFor(depth);
+        const thin = state.notes.length < minNotes;
+        const leads = pickLeads(state, 8);
+        const leadTarget = depth === "standard" ? 0 : depth === "deep" ? 3 : 6;
+        const leadsPending = state.readsAfterFirstCheck < leadTarget && leads.length > 0;
+        // Out of time (or checked repeatedly): proceed with what exists; the report must say what is missing.
+        const outOfTime = Date.now() - state.startedAt >= getTimeBudgetMs() * 0.8 || state.coverageChecks >= 4;
+        state.readyToWrite = outOfTime || (gaps.length === 0 && !thin && !leadsPending);
+
+        const problems = [
+          gaps.length > 0 ? `no notes yet for Q${gaps.map((g) => g.id).join(", Q")}` : "",
+          thin ? `only ${state.notes.length} notes saved; at least ${minNotes} are needed` : "",
+          leadsPending ? `follow where your sources point: read at least ${leadTarget - state.readsAfterFirstCheck} more of the linked pages below` : "",
+        ].filter(Boolean);
         return {
           coverage,
+          notes: state.notes.length,
           ready: state.readyToWrite,
+          leads,
           message: state.readyToWrite
-            ? gaps.length === 0
-              ? "Every sub-question has evidence. You may now write the report."
-              : `Proceeding with gaps in Q${gaps.map((g) => g.id).join(", Q")}: state them plainly under limitations. You may now write the report.`
-            : `No notes yet for Q${gaps.map((g) => g.id).join(", Q")}. Research them (or call check_coverage again to accept the gap), then continue.`,
+            ? problems.length > 0
+              ? `Out of time, so proceeding with gaps (${problems.join("; ")}): state them plainly under limitations. Continue to your analysis.`
+              : "The evidence is sufficient. Continue to your analysis."
+            : `Not ready: ${problems.join("; ")}. ${
+                leads.length > 0 ? "Pages your sources link to (chapters, commentary, parallel passages) are listed under leads: read the relevant ones with read_documents. " : ""
+              }Then save notes and call check_coverage again.`,
         };
       },
     }),
@@ -458,6 +520,49 @@ function getTools(state: RunState, depth: "standard" | "deep" | "really-deep") {
           outline: input.outline.slice(0, 14).map((o) => o.slice(0, 120)),
         };
         return { analysed: true, findings: state.analysis.findings.length, tensions: state.analysis.tensions.length };
+      },
+    }),
+    submit_report: tool({
+      description:
+        "Deliver the finished report. Pass the complete report as Markdown. The report is checked before it is accepted: if it is too thin, opens with process talk, cites notes that do not exist, or ignores your evidence, it is rejected with the reasons and you must fix it and submit again (or research more if told to).",
+      inputSchema: z.object({
+        markdown: z
+          .string()
+          .min(1)
+          .describe("The complete report in Markdown: no preamble, no process talk, no sources list; begin with the bottom line."),
+      }),
+      execute: async ({ markdown }) => {
+        if (!state.readyToWrite && !state.finalizing) {
+          return { error: "Research is not complete yet. Continue researching and call check_coverage first." };
+        }
+        state.reportAttempts += 1;
+        const result = checkReport({
+          markdown,
+          depth,
+          noteCount: state.notes.length,
+          noteSubQuestions: state.notes.map((note) => note.subQuestion),
+          subQuestionCount: state.plan?.subQuestions.length ?? 0,
+          relaxed: state.finalizing,
+        });
+        const final = state.finalizing || state.reportAttempts >= 4;
+        if (result.evidence.length > 0 && !final) {
+          // The evidence is not good enough to write from: go back to the sources.
+          state.readyToWrite = false;
+          state.analysis = undefined;
+          state.analysisAttempts = 0;
+          console.info(`[research] report rejected (evidence): ${result.evidence.join("; ")}`);
+          return {
+            error: `Rejected: ${result.evidence.join("; ")}. Go back and research more: read further pages (follow the links in pages you read), save more notes, then call check_coverage, analyze_evidence, and submit the report again.`,
+          };
+        }
+        if (result.style.length > 0 && !final) {
+          console.info(`[research] report rejected (style): ${result.style.join("; ")}`);
+          return { error: `Rejected: ${result.style.join("; ")}. Rewrite the whole report fixing these and call submit_report again.` };
+        }
+        state.accepted = true;
+        state.qualityIssues = [...result.style, ...result.evidence];
+        console.info(`[research] report accepted after ${state.reportAttempts} attempt(s), ${state.qualityIssues.length} issues`);
+        return { accepted: true, issues: state.qualityIssues };
       },
     }),
     create_diagram: tool({
@@ -544,6 +649,14 @@ export async function POST(request: NextRequest) {
     reads: 0,
     diagramAttempts: 0,
     analysisAttempts: 0,
+    startedAt,
+    linkPool: new Map(),
+    readKeys: new Set(),
+    readsAfterFirstCheck: 0,
+    reportAttempts: 0,
+    accepted: false,
+    finalizing: false,
+    qualityIssues: [],
   };
   const baseSystem = buildSystemPrompt(parsed.data.language, depth, deliverables);
   const modelName = process.env.MISTRAL_MODEL || DEFAULT_MODEL;
@@ -554,7 +667,7 @@ export async function POST(request: NextRequest) {
       system: baseSystem,
       messages: await convertToModelMessages(stripOldToolParts(messages)),
       tools: getTools(state, depth),
-      stopWhen: stepCountIs(ceiling),
+      stopWhen: [stepCountIs(ceiling), () => state.accepted],
       maxOutputTokens: 16_000,
       // Low-cost API tiers rate-limit; retry with backoff instead of failing a long run.
       maxRetries: 6,
@@ -583,22 +696,21 @@ export async function POST(request: NextRequest) {
         if (!state.plan && !finalize) {
           return { system, messages, toolChoice: { type: "tool" as const, toolName: "plan_research" as const } };
         }
-        // Out of budget: write the report now.
-        if (finalize) return { system, messages, toolChoice: "none" as const };
-        // Coverage confirmed: optionally draw grounded diagrams, then write.
+        if (state.accepted) return { system, messages, toolChoice: "none" as const };
+        // Out of budget: deliver the best honest report from what exists (checked leniently).
+        if (finalize) {
+          state.finalizing = true;
+          return { system, messages, toolChoice: { type: "tool" as const, toolName: "submit_report" as const } };
+        }
+        // Coverage confirmed: analyse, optionally draw grounded diagrams, then submit the report.
         if (state.readyToWrite) {
-          // Reason over the evidence before writing (a few tries if the first is rejected).
           if (!state.analysis && state.analysisAttempts < 3) {
             return { system, messages, toolChoice: { type: "tool" as const, toolName: "analyze_evidence" as const } };
           }
-          const canDraw = deliverables.diagrams && state.diagrams.length < MAX_DIAGRAMS;
-          if (!canDraw) return { system, messages, toolChoice: "none" as const };
-          // The reader asked for diagrams: make sure at least one real one exists (a few tries if the
-          // first is rejected for citing a page that was never retrieved), then let the model write.
-          if (state.diagrams.length === 0 && state.diagramAttempts < 3) {
+          if (deliverables.diagrams && state.diagrams.length === 0 && state.diagramAttempts < 3) {
             return { system, messages, toolChoice: { type: "tool" as const, toolName: "create_diagram" as const } };
           }
-          return { system, messages };
+          return { system, messages, toolChoice: { type: "tool" as const, toolName: "submit_report" as const } };
         }
         // Still researching: the model must keep using tools until check_coverage clears it.
         return { system, messages, toolChoice: "required" as const };

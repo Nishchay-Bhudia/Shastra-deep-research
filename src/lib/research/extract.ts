@@ -17,6 +17,8 @@ export type Analysis = {
   counts: { searches: number; reads: number; notes: number };
   /** Label for the tool call still in flight, if any. */
   activity?: string;
+  /** Why the delivered report fell short of the quality bar, if it did (e.g. the run ran out of time). */
+  qualityIssues: string[];
 };
 
 const ACTIVITY: Record<string, string> = {
@@ -28,6 +30,7 @@ const ACTIVITY: Record<string, string> = {
   check_coverage: "Checking coverage",
   analyze_evidence: "Analysing the evidence",
   create_diagram: "Drawing a diagram",
+  submit_report: "Writing the report",
 };
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
@@ -42,6 +45,9 @@ export function analyzeMessage(message: MessageLike): Analysis {
   const counts = { searches: 0, reads: 0, notes: 0 };
   let plan: Plan | undefined;
   let activity: string | undefined;
+  let reportMarkdown: string | undefined;
+  let reportAccepted = false;
+  let qualityIssues: string[] = [];
 
   const addSource = (url: unknown, title: unknown, overwrite = false) => {
     if (typeof url !== "string") return;
@@ -67,6 +73,19 @@ export function analyzeMessage(message: MessageLike): Analysis {
           reportTitle: input.reportTitle,
           subQuestions: input.subQuestions.filter((q): q is string => typeof q === "string"),
         };
+      }
+    }
+    if (name === "submit_report" && isObject(part.input) && typeof part.input.markdown === "string") {
+      // Rejected submissions are drafts that the agent rewrites; only an accepted one is the report.
+      const accepted = part.state === "output-available" && isObject(part.output) && part.output.accepted === true;
+      if (accepted) {
+        reportMarkdown = part.input.markdown;
+        reportAccepted = true;
+        qualityIssues = Array.isArray((part.output as Record<string, unknown>).issues)
+          ? ((part.output as { issues: unknown[] }).issues.filter((i): i is string => typeof i === "string"))
+          : [];
+      } else if (!reportAccepted && (part.state === "input-streaming" || part.state === "input-available")) {
+        reportMarkdown = part.input.markdown; // being written right now
       }
     }
     if (part.state !== "output-available" || !isObject(part.output) || "error" in part.output) return;
@@ -120,11 +139,13 @@ export function analyzeMessage(message: MessageLike): Analysis {
     }
   });
 
-  const text = parts
+  // Older chats (before reports were delivered through submit_report) kept the report as plain text.
+  const legacyText = parts
     .slice(lastToolIndex + 1)
     .filter((part) => part.type === "text" && typeof part.text === "string")
     .map((part) => part.text)
     .join("");
 
-  return { text, plan, sources, notes, diagrams, counts, activity };
+  const text = reportMarkdown ?? (parts.some((part) => part.type === "tool-submit_report") ? "" : legacyText);
+  return { text, plan, sources, notes, diagrams, counts, activity, qualityIssues };
 }

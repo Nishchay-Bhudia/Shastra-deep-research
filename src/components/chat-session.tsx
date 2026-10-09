@@ -145,7 +145,12 @@ export function ChatSession({
       diagrams: analysis.diagrams,
       includeDiagrams: deliverables.diagrams,
     });
-    return { analysis, markdown };
+    // A report that fell short of the quality bar (for example, the run ran out of time) says so.
+    const notice =
+      analysis.qualityIssues.length > 0
+        ? `> **Quality notice:** this report is incomplete. ${analysis.qualityIssues.join("; ")}.\n\n`
+        : "";
+    return { analysis, markdown: markdown ? `${notice}${markdown}` : markdown };
   }
 
   async function createPdf(message: UIMessage, index: number) {

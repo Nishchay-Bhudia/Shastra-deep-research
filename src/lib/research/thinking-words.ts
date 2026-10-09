@@ -34,6 +34,8 @@ export function phaseFor(activity: string | undefined, hasPlan: boolean, writing
       return "noting";
     case "Checking coverage":
       return "checking";
+    case "Writing the report":
+      return "writing";
     case "Analysing the evidence":
       return "analysing";
     case "Drawing a diagram":
